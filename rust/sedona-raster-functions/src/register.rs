@@ -1,0 +1,92 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+use sedona_expr::function_set::FunctionSet;
+
+/// Export the set of functions defined in this crate
+pub fn default_function_set() -> FunctionSet {
+    let mut function_set = FunctionSet::new();
+
+    macro_rules! register_scalar_udfs {
+        ($function_set:expr, $($udf:expr),* $(,)?) => {
+            $(
+                $function_set.insert_scalar_udf($udf());
+            )*
+        };
+    }
+
+    macro_rules! register_aggregate_udfs {
+        ($function_set:expr, $($udf:expr),* $(,)?) => {
+            $(
+                $function_set.insert_aggregate_udf($udf());
+            )*
+        };
+    }
+
+    register_scalar_udfs!(
+        function_set,
+        crate::rs_band_accessors::rs_bandpixeltype_udf,
+        crate::rs_band_accessors::rs_bandnodatavalue_udf,
+        crate::rs_bandpath::rs_bandpath_udf,
+        crate::rs_convexhull::rs_convexhull_udf,
+        crate::rs_dim_band::rs_dimtoband_udf,
+        crate::rs_dim_band::rs_bandtodim_udf,
+        crate::rs_dimensions::rs_numdimensions_udf,
+        crate::rs_dimensions::rs_dimnames_udf,
+        crate::rs_dimensions::rs_dimsize_udf,
+        crate::rs_dimensions::rs_shape_udf,
+        crate::rs_envelope::rs_envelope_udf,
+        crate::rs_example::rs_example_udf,
+        crate::rs_georeference::rs_georeference_udf,
+        crate::rs_isempty::rs_isempty_udf,
+        crate::rs_geotransform::rs_rotation_udf,
+        crate::rs_geotransform::rs_scalex_udf,
+        crate::rs_geotransform::rs_scaley_udf,
+        crate::rs_geotransform::rs_skewx_udf,
+        crate::rs_geotransform::rs_skewy_udf,
+        crate::rs_geotransform::rs_upperleftx_udf,
+        crate::rs_geotransform::rs_upperlefty_udf,
+        crate::rs_numbands::rs_numbands_udf,
+        crate::rs_pixel_functions::rs_pixelaspoint_udf,
+        crate::rs_pixel_functions::rs_pixelascentroid_udf,
+        crate::rs_pixel_functions::rs_pixelaspolygon_udf,
+        crate::rs_rastercoordinate::rs_worldtorastercoord_udf,
+        crate::rs_rastercoordinate::rs_worldtorastercoordx_udf,
+        crate::rs_rastercoordinate::rs_worldtorastercoordy_udf,
+        crate::rs_set_band_nodata::rs_set_band_nodata_value_udf,
+        crate::rs_set_georeference::rs_set_georeference_udf,
+        crate::rs_setsrid::rs_set_crs_udf,
+        crate::rs_setsrid::rs_set_srid_udf,
+        crate::rs_size::rs_height_udf,
+        crate::rs_size::rs_width_udf,
+        crate::rs_slice::rs_slice_udf,
+        crate::rs_slice::rs_slicerange_udf,
+        crate::rs_spatial_predicates::rs_contains_udf,
+        crate::rs_spatial_predicates::rs_intersects_udf,
+        crate::rs_spatial_predicates::rs_within_udf,
+        crate::rs_srid::rs_crs_udf,
+        crate::rs_srid::rs_srid_udf,
+        crate::rs_value::rs_value_udf,
+        crate::rs_values::rs_values_udf,
+        crate::rs_worldcoordinate::rs_rastertoworldcoord_udf,
+        crate::rs_worldcoordinate::rs_rastertoworldcoordx_udf,
+        crate::rs_worldcoordinate::rs_rastertoworldcoordy_udf,
+    );
+
+    register_aggregate_udfs!(function_set,);
+
+    function_set
+}

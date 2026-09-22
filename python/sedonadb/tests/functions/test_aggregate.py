@@ -1,0 +1,434 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import geopandas
+import geopandas.testing
+import pytest
+import shapely
+from sedonadb.testing import PostGIS, SedonaDB, skip_if_not_exists
+
+
+# Aggregate functions don't have a suffix in PostGIS
+def agg_fn_suffix(eng):
+    return "" if isinstance(eng, PostGIS) else "_Agg"
+
+
+# ST_Envelope is not an aggregate function in PostGIS but we can check
+# behaviour using ST_Envelope(ST_Collect(...))
+def call_st_envelope_agg(eng, arg):
+    if isinstance(eng, PostGIS):
+        return f"ST_Envelope(ST_Collect({arg}))"
+    else:
+        return f"ST_Envelope_Agg({arg})"
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_envelope_agg_points(eng):
+    eng = eng.create_or_skip()
+
+    eng.assert_query_result(
+        f"""SELECT {call_st_envelope_agg(eng, "ST_GeomFromText(geom)")} FROM (
+            VALUES
+                ('POINT (1 2)'),
+                ('POINT (3 4)'),
+                (NULL)
+        ) AS t(geom)""",
+        "POLYGON ((1 2, 1 4, 3 4, 3 2, 1 2))",
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_envelope_agg_all_null(eng):
+    eng = eng.create_or_skip()
+
+    eng.assert_query_result(
+        f"""SELECT {call_st_envelope_agg(eng, "ST_GeomFromText(geom)")} FROM (
+            VALUES
+                (NULL),
+                (NULL),
+                (NULL)
+        ) AS t(geom)""",
+        None,
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_envelope_agg_zero_input(eng):
+    eng = eng.create_or_skip()
+
+    eng.assert_query_result(
+        f"""SELECT {call_st_envelope_agg(eng, "ST_GeomFromText(geom)")} AS empty FROM (
+            VALUES
+                ('POINT (1 2)')
+        ) AS t(geom) WHERE false""",
+        None,
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_envelope_agg_single_point(eng):
+    eng = eng.create_or_skip()
+
+    eng.assert_query_result(
+        f"""SELECT {call_st_envelope_agg(eng, "ST_GeomFromText(geom)")} FROM (
+            VALUES ('POINT (5 5)')
+        ) AS t(geom)""",
+        "POINT (5 5)",
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_envelope_agg_collinear_points(eng):
+    eng = eng.create_or_skip()
+
+    eng.assert_query_result(
+        f"""SELECT {call_st_envelope_agg(eng, "ST_GeomFromText(geom)")} FROM (
+            VALUES
+                ('POINT (0 0)'),
+                ('POINT (0 1)'),
+                ('POINT (0 2)')
+        ) AS t(geom)""",
+        "LINESTRING (0 0, 0 2)",
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_envelope_agg_many_groups(eng, con):
+    eng = eng.create_or_skip()
+    num_groups = 1000
+
+    df_points = con.sql("""
+        SELECT id, geometry FROM sd_random_geometry('{"num_rows": 100000, "seed": 9728}')
+    """)
+    eng.create_table_arrow("df_points", df_points.to_arrow_table())
+
+    result = eng.execute_and_collect(
+        f"""
+        SELECT
+            (id % {num_groups})::INTEGER AS id_mod,
+            {call_st_envelope_agg(eng, "geometry")} AS envelope
+        FROM df_points
+        GROUP BY id_mod
+        ORDER BY id_mod
+        """,
+    )
+
+    df_points_geopandas = df_points.to_pandas()
+    expected = (
+        df_points_geopandas.groupby(df_points_geopandas["id"] % num_groups)["geometry"]
+        .apply(lambda group: shapely.box(*group.total_bounds))
+        .reset_index(name="envelope")
+        .rename(columns={"id": "id_mod"})
+    )
+
+    eng.assert_result(result, expected)
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_envelope_nontrivial_input(eng, geoarrow_data):
+    path = geoarrow_data / "ns-water" / "files" / "ns-water_water-point_geo.parquet"
+    eng = eng.create_or_skip()
+    skip_if_not_exists(path)
+
+    df_points_geopandas = geopandas.read_parquet(path)
+    expected = (
+        df_points_geopandas.groupby(df_points_geopandas.FEAT_CODE)["geometry"]
+        .apply(
+            lambda group: shapely.Point(*group.total_bounds[:2])
+            if len(group) == 1
+            else shapely.box(*group.total_bounds)
+        )
+        .reset_index()
+    ).set_crs(df_points_geopandas.crs)
+
+    eng.create_table_parquet("pts", path)
+    result = eng.execute_and_collect(f"""
+        SELECT  "FEAT_CODE", {call_st_envelope_agg(eng, "geometry")} AS geometry
+        FROM pts
+        GROUP BY "FEAT_CODE"
+        ORDER BY "FEAT_CODE"
+    """)
+
+    # This CRS is too complicated to check roundtripping through PostGIS
+    df = eng.result_to_pandas(result)
+    geopandas.testing.assert_geodataframe_equal(df, expected, check_crs=False)
+
+
+@pytest.mark.parametrize("eng", [SedonaDB])
+@pytest.mark.parametrize("num_groups", [None, 1, 7, 2000])
+def test_st_convexhull_agg_matches_collect_chain(eng, con, num_groups):
+    eng = eng.create_or_skip()
+
+    df_points = con.sql("""
+        SELECT id, geometry FROM sd_random_geometry(
+            '{"geom_type": "Point", "num_rows": 2000, "seed": 9728}'
+        )
+    """)
+    eng.create_table_arrow("df_points", df_points.to_arrow_table())
+
+    if num_groups is None:
+        select_prefix = ""
+        group_by_clause = ""
+    else:
+        select_prefix = f"(id % {num_groups}) AS id_mod,"
+        group_by_clause = "GROUP BY id_mod ORDER BY id_mod"
+
+    result_new = eng.execute_and_collect(f"""
+        SELECT {select_prefix} ST_ConvexHull_Agg(geometry) AS hull
+        FROM df_points
+        {group_by_clause}
+    """)
+    result_old = eng.execute_and_collect(f"""
+        SELECT {select_prefix} ST_ConvexHull(ST_Collect_Agg(geometry)) AS hull
+        FROM df_points
+        {group_by_clause}
+    """)
+
+    geopandas.testing.assert_geodataframe_equal(
+        eng.result_to_pandas(result_new),
+        eng.result_to_pandas(result_old),
+        normalize=True,
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB])
+def test_st_convexhull_agg_zero_rows(eng):
+    eng = eng.create_or_skip()
+
+    eng.assert_query_result(
+        """SELECT ST_ConvexHull_Agg(ST_GeomFromText(geom)) FROM (
+            VALUES ('POINT (1 2)')
+        ) AS t(geom) WHERE false""",
+        None,
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB])
+def test_st_convexhull_agg_all_null_input(eng):
+    eng = eng.create_or_skip()
+
+    eng.assert_query_result(
+        """SELECT ST_ConvexHull_Agg(ST_GeomFromText(geom)) FROM (
+            VALUES (NULL), (NULL), (NULL)
+        ) AS t(geom)""",
+        None,
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_collect_points(eng):
+    eng = eng.create_or_skip()
+    suffix = agg_fn_suffix(eng)
+    eng.assert_query_result(
+        f"""SELECT ST_Collect{suffix}(ST_GeomFromText(geom)) FROM (
+            VALUES
+                ('POINT (1 2)'),
+                ('POINT (3 4)'),
+                (NULL)
+        ) AS t(geom)""",
+        "MULTIPOINT (1 2, 3 4)",
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_collect_linestrings(eng):
+    eng = eng.create_or_skip()
+    suffix = agg_fn_suffix(eng)
+    eng.assert_query_result(
+        f"""SELECT ST_Collect{suffix}(ST_GeomFromText(geom)) FROM (
+            VALUES
+                ('LINESTRING (1 2, 3 4)'),
+                ('LINESTRING (5 6, 7 8)'),
+                (NULL)
+        ) AS t(geom)""",
+        "MULTILINESTRING ((1 2, 3 4), (5 6, 7 8))",
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_collect_polygons(eng):
+    eng = eng.create_or_skip()
+    suffix = agg_fn_suffix(eng)
+    eng.assert_query_result(
+        f"""SELECT ST_Collect{suffix}(ST_GeomFromText(geom)) FROM (
+            VALUES
+                ('POLYGON ((0 0, 1 0, 0 1, 0 0))'),
+                ('POLYGON ((10 10, 11 10, 10 11, 10 10))'),
+                (NULL)
+        ) AS t(geom)""",
+        "MULTIPOLYGON (((0 0, 1 0, 0 1, 0 0)), ((10 10, 11 10, 10 11, 10 10)))",
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_collect_mixed_types(eng):
+    eng = eng.create_or_skip()
+    suffix = agg_fn_suffix(eng)
+    eng.assert_query_result(
+        f"""SELECT ST_Collect{suffix}(ST_GeomFromText(geom)) FROM (
+            VALUES
+                ('POINT (1 2)'),
+                ('LINESTRING (3 4, 5 6)'),
+                (NULL)
+        ) AS t(geom)""",
+        "GEOMETRYCOLLECTION (POINT (1 2), LINESTRING (3 4, 5 6))",
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_collect_mixed_dimensions(eng):
+    eng = eng.create_or_skip()
+    suffix = agg_fn_suffix(eng)
+    with pytest.raises(Exception, match="mixed dimension geometries"):
+        eng.assert_query_result(
+            f"""SELECT ST_Collect{suffix}(ST_GeomFromText(geom)) FROM (
+                VALUES
+                    ('POINT (1 2)'),
+                    ('POINT Z (3 4 5)'),
+                    (NULL)
+            ) AS t(geom)""",
+            "MULTIPOINT (1 2, 3 4)",
+        )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_collect_all_null(eng):
+    eng = eng.create_or_skip()
+    suffix = agg_fn_suffix(eng)
+    eng.assert_query_result(
+        f"""SELECT ST_Collect{suffix}(geom) FROM (
+            VALUES
+                (NULL),
+                (NULL),
+                (NULL)
+        ) AS t(geom)""",
+        None,
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_collect_zero_input(eng):
+    eng = eng.create_or_skip()
+    suffix = agg_fn_suffix(eng)
+    eng.assert_query_result(
+        f"""SELECT ST_Collect{suffix}(ST_GeomFromText(geom)) AS empty FROM (
+            VALUES
+                ('POINT (1 2)')
+        ) AS t(geom) WHERE false""",
+        None,
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_polygonize_basic_triangle(eng):
+    eng = eng.create_or_skip()
+    suffix = agg_fn_suffix(eng)
+    eng.assert_query_result(
+        f"""SELECT ST_Polygonize{suffix}(ST_GeomFromText(geom)) FROM (
+            VALUES
+                ('LINESTRING (0 0, 10 0)'),
+                ('LINESTRING (10 0, 10 10)'),
+                ('LINESTRING (10 10, 0 0)')
+        ) AS t(geom)""",
+        "GEOMETRYCOLLECTION (POLYGON ((10 0, 0 0, 10 10, 10 0)))",
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_polygonize_with_nulls(eng):
+    eng = eng.create_or_skip()
+    suffix = agg_fn_suffix(eng)
+    eng.assert_query_result(
+        f"""SELECT ST_Polygonize{suffix}(ST_GeomFromText(geom)) FROM (
+            VALUES
+                ('LINESTRING (0 0, 10 0)'),
+                (NULL),
+                ('LINESTRING (10 0, 10 10)'),
+                (NULL),
+                ('LINESTRING (10 10, 0 0)')
+        ) AS t(geom)""",
+        "GEOMETRYCOLLECTION (POLYGON ((10 0, 0 0, 10 10, 10 0)))",
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_polygonize_no_polygons_formed(eng):
+    eng = eng.create_or_skip()
+    suffix = agg_fn_suffix(eng)
+    eng.assert_query_result(
+        f"""SELECT ST_Polygonize{suffix}(ST_GeomFromText(geom)) FROM (
+            VALUES
+                ('LINESTRING (0 0, 10 0)'),
+                ('LINESTRING (20 0, 30 0)')
+        ) AS t(geom)""",
+        "GEOMETRYCOLLECTION EMPTY",
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_polygonize_multiple_polygons(eng):
+    eng = eng.create_or_skip()
+    suffix = agg_fn_suffix(eng)
+    eng.assert_query_result(
+        f"""SELECT ST_Polygonize{suffix}(ST_GeomFromText(geom)) FROM (
+            VALUES
+                ('LINESTRING (0 0, 10 0)'),
+                ('LINESTRING (10 0, 5 10)'),
+                ('LINESTRING (5 10, 0 0)'),
+                ('LINESTRING (20 0, 30 0)'),
+                ('LINESTRING (30 0, 25 10)'),
+                ('LINESTRING (25 10, 20 0)')
+        ) AS t(geom)""",
+        "GEOMETRYCOLLECTION (POLYGON ((10 0, 0 0, 5 10, 10 0)), POLYGON ((30 0, 20 0, 25 10, 30 0)))",
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+@pytest.mark.parametrize(
+    ("geom", "expected"),
+    [
+        (
+            "POLYGON ((10 0, 0 0, 10 10, 10 0))",
+            "GEOMETRYCOLLECTION (POLYGON ((10 0, 0 0, 10 10, 10 0)))",
+        ),
+        (
+            "LINESTRING (0 0, 0 1, 1 1, 1 0, 0 0)",
+            "GEOMETRYCOLLECTION (POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0)))",
+        ),
+        ("POINT (0 0)", "GEOMETRYCOLLECTION EMPTY"),
+        ("MULTIPOINT ((0 0), (1 1))", "GEOMETRYCOLLECTION EMPTY"),
+        ("MULTILINESTRING ((0 0, 1 1), (2 2, 3 3))", "GEOMETRYCOLLECTION EMPTY"),
+        (
+            "MULTIPOLYGON (((0 0, 1 0, 0 1, 0 0)), ((10 10, 11 10, 10 11, 10 10)))",
+            "GEOMETRYCOLLECTION (POLYGON ((0 0, 0 1, 1 0, 0 0)), POLYGON ((10 10, 10 11, 11 10, 10 10)))",
+        ),
+        (
+            "GEOMETRYCOLLECTION (POINT (0 0), LINESTRING (0 0, 1 1))",
+            "GEOMETRYCOLLECTION EMPTY",
+        ),
+        ("LINESTRING EMPTY", "GEOMETRYCOLLECTION EMPTY"),
+    ],
+)
+def test_st_polygonize_single_geom(eng, geom, expected):
+    eng = eng.create_or_skip()
+    suffix = agg_fn_suffix(eng)
+    eng.assert_query_result(
+        f"""SELECT ST_Polygonize{suffix}(ST_GeomFromText(geom)) FROM (
+            VALUES ('{geom}')
+        ) AS t(geom)""",
+        expected,
+    )

@@ -1,0 +1,562 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+use std::{collections::HashMap, sync::Arc};
+
+use arrow_schema::{DataType, SchemaRef};
+use async_trait::async_trait;
+use datafusion::{
+    config::TableOptions,
+    datasource::{
+        file_format::parquet::ParquetFormat,
+        listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
+    },
+    execution::{options::ReadOptions, SessionState},
+    prelude::{ParquetReadOptions, SessionConfig, SessionContext},
+};
+use datafusion_common::{exec_err, plan_err, Result};
+
+use crate::{
+    format::GeoParquetFormat, metadata::GeoParquetColumnMetadata, options::TableGeoParquetOptions,
+};
+
+/// Create a [ListingTable] of GeoParquet (or normal Parquet) files
+///
+/// Because [ListingTable] implements `TableProvider`, this can be used to
+/// implement geo-aware Parquet reading with interfaces that are otherwise
+/// hard-coded to the built-in Parquet reader.
+pub async fn geoparquet_listing_table(
+    context: &SessionContext,
+    table_paths: Vec<ListingTableUrl>,
+    options: GeoParquetReadOptions<'_>,
+) -> Result<ListingTable> {
+    let session_config = context.copied_config();
+    let listing_options =
+        options.to_listing_options(&session_config, context.copied_table_options());
+
+    let option_extension = listing_options.file_extension.clone();
+
+    if table_paths.is_empty() {
+        return exec_err!("No table paths were provided");
+    }
+
+    // check if the file extension matches the expected extension
+    for path in &table_paths {
+        let file_path = path.as_str();
+        let path_without_query = file_path.split('?').next().unwrap_or(file_path);
+        if !path_without_query.ends_with(option_extension.clone().as_str()) && !path.is_collection()
+        {
+            return exec_err!(
+                    "File path '{file_path}' does not match the expected extension '{option_extension}'"
+                );
+        }
+    }
+
+    // Auto-discover partition columns if not explicitly set and config allows it
+    let should_infer = !options.partition_cols_set
+        && session_config
+            .options()
+            .execution
+            .listing_table_factory_infer_partitions;
+
+    let listing_options = if should_infer {
+        let inferred_partitions = listing_options
+            .infer_partitions(&context.state(), &table_paths[0])
+            .await?;
+        if !inferred_partitions.is_empty() {
+            listing_options.with_table_partition_cols(
+                inferred_partitions
+                    .into_iter()
+                    .map(|name| (name, DataType::Utf8View))
+                    .collect(),
+            )
+        } else {
+            listing_options
+        }
+    } else {
+        listing_options
+    };
+
+    let resolved_schema = options
+        .get_resolved_schema(&session_config, context.state(), table_paths[0].clone())
+        .await?;
+    let config = ListingTableConfig::new_with_multi_paths(table_paths)
+        .with_listing_options(listing_options)
+        .with_schema(resolved_schema);
+
+    ListingTable::try_new(config)
+}
+
+/// GeoParquet read options
+///
+/// Currently is just a wrapper around [ParquetReadOptions] that sets the
+/// correct file format when creating [ListingOptions].
+#[derive(Default, Clone)]
+pub struct GeoParquetReadOptions<'a> {
+    inner: ParquetReadOptions<'a>,
+    table_options: Option<HashMap<String, String>>,
+    geometry_columns: Option<HashMap<String, GeoParquetColumnMetadata>>,
+    validate: bool,
+    /// When true, partition columns were explicitly set (skip auto-discovery)
+    partition_cols_set: bool,
+}
+
+impl GeoParquetReadOptions<'_> {
+    /// Create a new GeoParquetReadOptions with default values
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    /// Create GeoParquetReadOptions from table options HashMap
+    /// Validates that AWS and Azure options are spelled correctly to help catch user errors
+    pub fn from_table_options(options: HashMap<String, String>) -> Result<Self, String> {
+        for key in options.keys() {
+            if key.starts_with("aws.") {
+                // Keep this list in sync with the options consumed by
+                // `AwsOptions::set` in `sedona::object_storage`. The previous
+                // list accepted several options (`aws.bucket_name`,
+                // `aws.use_ssl`, `aws.force_path_style`, `aws.nosign`) that are
+                // never consumed there -- they passed validation here but were
+                // silently dropped by `to_listing_options`, so a user setting
+                // them got no effect and no error. Conversely it rejected
+                // `aws.allow_http` and `aws.session_token`, which _are_
+                // consumed. The list below now matches the consumer exactly.
+                let common_aws_options = [
+                    "aws.access_key_id",
+                    "aws.secret_access_key",
+                    "aws.session_token",
+                    "aws.region",
+                    "aws.endpoint",
+                    "aws.allow_http",
+                    "aws.skip_signature",
+                ];
+
+                if !common_aws_options.contains(&key.as_str()) {
+                    let close_matches: Vec<&str> = common_aws_options
+                        .iter()
+                        .filter(|&&option| {
+                            let key_start = &key[4..];
+                            let option_start = &option[4..];
+
+                            option_start.starts_with(key_start)
+                                || key_start.starts_with(option_start)
+                                || (key_start.len() >= 4
+                                    && option_start.len() >= 4
+                                    && key_start[..4] == option_start[..4])
+                        })
+                        .cloned()
+                        .collect();
+
+                    if !close_matches.is_empty() {
+                        return Err(format!(
+                            "Unknown AWS option '{}'. Did you mean: {}?",
+                            key,
+                            close_matches.join(", ")
+                        ));
+                    } else {
+                        return Err(format!(
+                            "Unknown AWS option '{}'. Valid options are: {}",
+                            key,
+                            common_aws_options.join(", ")
+                        ));
+                    }
+                }
+            } else if key.starts_with("azure.") {
+                let common_azure_options = [
+                    "azure.account_name",
+                    "azure.account_key",
+                    "azure.sas_token",
+                    "azure.container_name",
+                    "azure.use_emulator",
+                    "azure.client_id",
+                    "azure.client_secret",
+                    "azure.tenant_id",
+                    "azure.allow_http",
+                ];
+
+                if !common_azure_options.contains(&key.as_str()) {
+                    let close_matches: Vec<&str> = common_azure_options
+                        .iter()
+                        .filter(|&&option| {
+                            let key_start = &key[6..];
+                            let option_start = &option[6..];
+
+                            option_start.starts_with(key_start)
+                                || key_start.starts_with(option_start)
+                                || (key_start.len() >= 4
+                                    && option_start.len() >= 4
+                                    && key_start[..4] == option_start[..4])
+                        })
+                        .cloned()
+                        .collect();
+
+                    if !close_matches.is_empty() {
+                        return Err(format!(
+                            "Unknown Azure option '{}'. Did you mean: {}?",
+                            key,
+                            close_matches.join(", ")
+                        ));
+                    } else {
+                        return Err(format!(
+                            "Unknown Azure option '{}'. Valid options are: {}",
+                            key,
+                            common_azure_options.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(GeoParquetReadOptions {
+            inner: ParquetReadOptions::default(),
+            table_options: Some(options),
+            geometry_columns: None,
+            validate: false,
+            partition_cols_set: false,
+        })
+    }
+
+    /// Get the table options
+    pub fn table_options(&self) -> Option<&HashMap<String, String>> {
+        self.table_options.as_ref()
+    }
+
+    /// Add geometry column metadata (JSON string) to apply during schema resolution
+    ///
+    /// Reads Parquet files as if GeoParquet metadata with the `"geometry_columns"`
+    /// key were present. If GeoParquet metadata is already present, the values provided
+    /// here will override any definitions provided in the original metadata.
+    ///
+    /// Errors if an invalid JSON configuration string is provided
+    pub fn with_geometry_columns_json(mut self, geometry_columns_json: &str) -> Result<Self> {
+        let geometry_columns = parse_geometry_columns_json(geometry_columns_json)?;
+        self.geometry_columns = Some(geometry_columns);
+        Ok(self)
+    }
+
+    /// Get the geometry columns metadata
+    pub fn geometry_columns(&self) -> Option<&HashMap<String, GeoParquetColumnMetadata>> {
+        self.geometry_columns.as_ref()
+    }
+
+    /// Enable/disable geometry content validation.
+    pub fn with_validate(mut self, validate: bool) -> Self {
+        self.validate = validate;
+        self
+    }
+
+    /// Get whether geometry content validation is enabled.
+    pub fn validate(&self) -> bool {
+        self.validate
+    }
+
+    /// Set table partition columns for hive-style partitioning
+    ///
+    /// Partition columns are extracted from directory paths like `/col=value/`.
+    /// All partition columns are assumed to be `Utf8View` type.
+    ///
+    /// Pass an empty vector to explicitly disable partition auto-discovery.
+    pub fn with_table_partition_cols(mut self, cols: Vec<(String, DataType)>) -> Self {
+        self.inner = self.inner.table_partition_cols(cols);
+        self.partition_cols_set = true;
+        self
+    }
+
+    /// Get the table partition columns
+    pub fn table_partition_cols(&self) -> &[(String, DataType)] {
+        &self.inner.table_partition_cols
+    }
+
+    /// Returns true if partition columns were explicitly set
+    pub fn partition_cols_explicitly_set(&self) -> bool {
+        self.partition_cols_set
+    }
+}
+
+fn parse_geometry_columns_json(
+    geometry_columns_json: &str,
+) -> Result<HashMap<String, GeoParquetColumnMetadata>> {
+    let columns: HashMap<String, GeoParquetColumnMetadata> =
+        match serde_json::from_str(geometry_columns_json) {
+            Ok(columns) => columns,
+            Err(e) => return plan_err!("geometry_columns must be valid JSON: {e}"),
+        };
+
+    Ok(columns)
+}
+
+#[async_trait]
+impl ReadOptions<'_> for GeoParquetReadOptions<'_> {
+    fn to_listing_options(
+        &self,
+        config: &SessionConfig,
+        mut table_options: TableOptions,
+    ) -> ListingOptions {
+        // Merge custom table options if provided
+        if let Some(ref custom_options) = self.table_options {
+            for (key, value) in custom_options {
+                if let Err(_e) = table_options.set(key, value) {
+                    // Silently continue for now - unknown options are ignored for compatibility
+                    // The validation happens in from_table_options() method
+                }
+            }
+        }
+
+        let mut options = self.inner.to_listing_options(config, table_options);
+
+        if let Some(parquet_format) = options.format.as_any().downcast_ref::<ParquetFormat>() {
+            let mut geoparquet_options =
+                TableGeoParquetOptions::from(parquet_format.options().clone());
+            if let Some(geometry_columns) = &self.geometry_columns {
+                geoparquet_options.geometry_columns =
+                    crate::options::GeometryColumns::from_map(geometry_columns.clone());
+            }
+            geoparquet_options.validate = self.validate;
+            options.format = Arc::new(GeoParquetFormat::new(geoparquet_options));
+            return options;
+        }
+
+        unreachable!("GeoParquetReadOptions with non-ParquetFormat ListingOptions");
+    }
+
+    async fn get_resolved_schema(
+        &self,
+        config: &SessionConfig,
+        state: SessionState,
+        table_path: ListingTableUrl,
+    ) -> Result<SchemaRef> {
+        let schema = self
+            .to_listing_options(config, state.default_table_options())
+            .infer_schema(&state, &table_path)
+            .await?;
+        Ok(schema)
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    use arrow_schema::DataType;
+    use datafusion::datasource::file_format::format_as_file_type;
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::prelude::{col, lit};
+    use datafusion_expr::LogicalPlanBuilder;
+    use sedona_geometry::types::Edges;
+    use sedona_schema::{crs::lnglat, datatypes::SedonaType};
+    use sedona_testing::data::{geoarrow_data_dir, test_geoparquet};
+    use tempfile::tempdir;
+
+    use crate::format::GeoParquetFormatFactory;
+
+    use super::*;
+
+    #[test]
+    fn aws_option_allowlist_matches_consumer() {
+        // Options consumed by AwsOptions::set in sedona::object_storage must be
+        // accepted here; options NOT consumed there must be rejected (otherwise
+        // they are silently dropped in to_listing_options and mislead users).
+        for accepted in [
+            "aws.access_key_id",
+            "aws.secret_access_key",
+            "aws.session_token",
+            "aws.region",
+            "aws.endpoint",
+            "aws.allow_http",
+            "aws.skip_signature",
+        ] {
+            let mut opts = HashMap::new();
+            opts.insert(accepted.to_string(), "x".to_string());
+            GeoParquetReadOptions::from_table_options(opts)
+                .unwrap_or_else(|e| panic!("{accepted} should be accepted, got: {e}"));
+        }
+
+        for rejected in [
+            "aws.bucket_name",
+            "aws.use_ssl",
+            "aws.force_path_style",
+            "aws.nosign",
+        ] {
+            let mut opts = HashMap::new();
+            opts.insert(rejected.to_string(), "x".to_string());
+            // Avoid `expect_err`/`unwrap_err`: they require `Debug` on the
+            // `Ok` type, but `GeoParquetReadOptions` (via `ParquetReadOptions`)
+            // does not implement `Debug`.
+            let err = match GeoParquetReadOptions::from_table_options(opts) {
+                Ok(_) => panic!("{rejected} should be rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("Unknown AWS option"),
+                "{rejected} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_table() {
+        let ctx = SessionContext::new();
+        let data_dir = geoarrow_data_dir().unwrap();
+        let tab = geoparquet_listing_table(
+            &ctx,
+            vec![
+                ListingTableUrl::parse(format!("{data_dir}/example/files/*_geo.parquet")).unwrap(),
+            ],
+            GeoParquetReadOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let df = ctx.read_table(Arc::new(tab)).unwrap();
+
+        let sedona_types: Result<Vec<_>> = df
+            .schema()
+            .as_arrow()
+            .fields()
+            .iter()
+            .map(|f| SedonaType::from_storage_field(f))
+            .collect();
+        let sedona_types = sedona_types.unwrap();
+        assert_eq!(sedona_types.len(), 2);
+        assert_eq!(sedona_types[0], SedonaType::Arrow(DataType::Utf8View));
+        assert_eq!(
+            sedona_types[1],
+            SedonaType::WkbView(Edges::Planar, lnglat())
+        );
+
+        // Make sure all the rows show up!
+        let batches = df.collect().await.unwrap();
+        let mut total_size = 0;
+        for batch in batches {
+            total_size += batch.num_rows();
+        }
+        assert_eq!(total_size, 244);
+    }
+
+    #[tokio::test]
+    async fn listing_table_errors() {
+        let ctx = SessionContext::new();
+        let err = geoparquet_listing_table(
+            &ctx,
+            Vec::<ListingTableUrl>::new(),
+            GeoParquetReadOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.message(), "No table paths were provided");
+
+        let err = geoparquet_listing_table(
+            &ctx,
+            vec![ListingTableUrl::parse("foofy.wrongextension").unwrap()],
+            GeoParquetReadOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err
+            .message()
+            .ends_with("does not match the expected extension '.parquet'"));
+
+        let err = geoparquet_listing_table(
+            &ctx,
+            vec![ListingTableUrl::parse("this_file_does_not_exist.parquet").unwrap()],
+            GeoParquetReadOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "Can't infer Parquet schema for zero objects. Does the input path exist?"
+        );
+    }
+
+    fn setup_context() -> SessionContext {
+        let mut state = SessionStateBuilder::new().build();
+        state
+            .register_file_format(Arc::new(GeoParquetFormatFactory::new()), true)
+            .unwrap();
+        SessionContext::new_with_state(state).enable_url_table()
+    }
+
+    #[tokio::test]
+    async fn listing_table_with_partition_discovery() {
+        // Set up a context with our GeoParquet format registered
+        let ctx = setup_context();
+
+        // Read an existing GeoParquet file and add a partition column
+        let example = test_geoparquet("example", "point").unwrap();
+        let df = ctx
+            .table(&example)
+            .await
+            .unwrap()
+            .select(vec![
+                lit("partition_value").alias("part"),
+                col("wkt"),
+                col("geometry"),
+            ])
+            .unwrap();
+        let df_count = df.clone().count().await.unwrap();
+
+        // Write the data to a temp directory with hive-style partitioning
+        let tmpdir = tempdir().unwrap();
+        let tmp_parquet = tmpdir.path().join("partitioned.parquet");
+
+        let format = GeoParquetFormatFactory::new();
+        let file_type = format_as_file_type(Arc::new(format));
+
+        let plan = LogicalPlanBuilder::copy_to(
+            df.into_unoptimized_plan(),
+            tmp_parquet.to_string_lossy().into(),
+            file_type,
+            Default::default(),
+            // Partition by the "part" column
+            vec!["part".into()],
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        datafusion::prelude::DataFrame::new(ctx.state(), plan)
+            .collect()
+            .await
+            .unwrap();
+
+        // Now read it back using geoparquet_listing_table with partition discovery
+        let tab = geoparquet_listing_table(
+            &ctx,
+            vec![ListingTableUrl::parse(format!("{}/**", tmp_parquet.to_string_lossy())).unwrap()],
+            GeoParquetReadOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let df = ctx.read_table(Arc::new(tab)).unwrap();
+
+        // Check that the partition column is in the schema
+        let schema = df.schema();
+        let field_names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(
+            field_names.contains(&"part"),
+            "Partition column 'part' should be in the schema: {field_names:?}"
+        );
+
+        // Verify we can read the data
+        let batches = df.collect().await.unwrap();
+        let mut total_rows = 0;
+        for batch in &batches {
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, df_count);
+    }
+}

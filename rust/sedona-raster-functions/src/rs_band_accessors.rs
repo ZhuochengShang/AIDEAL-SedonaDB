@@ -1,0 +1,451 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::sync::Arc;
+use std::vec;
+
+use crate::executor::RasterExecutor;
+use arrow_array::builder::{Float64Builder, StringBuilder};
+use arrow_schema::DataType;
+use datafusion_common::cast::as_int32_array;
+use datafusion_common::error::Result;
+use datafusion_expr::{ColumnarValue, Volatility};
+use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
+use sedona_raster::traits::RasterRef;
+use sedona_schema::{datatypes::SedonaType, matchers::ArgMatcher};
+
+// ===========================================================================
+// RS_BandPixelType
+// ===========================================================================
+
+/// RS_BandPixelType() scalar UDF implementation
+///
+/// Returns the pixel data type of the specified band as a string.
+/// Accepts an optional band_index parameter (1-based, default is 1).
+pub fn rs_bandpixeltype_udf() -> SedonaScalarUDF {
+    SedonaScalarUDF::new(
+        "rs_bandpixeltype",
+        vec![
+            Arc::new(RsBandPixelType {}),
+            Arc::new(RsBandPixelTypeWithBand {}),
+        ],
+        Volatility::Immutable,
+    )
+}
+
+#[derive(Debug)]
+struct RsBandPixelType {}
+
+impl SedonaScalarKernel for RsBandPixelType {
+    fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+        let matcher = ArgMatcher::new(
+            vec![ArgMatcher::is_raster()],
+            SedonaType::Arrow(DataType::Utf8),
+        );
+        matcher.match_args(args)
+    }
+
+    fn invoke_batch(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+    ) -> Result<ColumnarValue> {
+        let executor = RasterExecutor::new(arg_types, args);
+        let mut builder =
+            StringBuilder::with_capacity(executor.num_iterations(), executor.num_iterations() * 20);
+
+        executor
+            .execute_raster_void(|_i, raster_opt| get_pixel_type(raster_opt, 1, &mut builder))?;
+
+        executor.finish(Arc::new(builder.finish()))
+    }
+}
+
+#[derive(Debug)]
+struct RsBandPixelTypeWithBand {}
+
+impl SedonaScalarKernel for RsBandPixelTypeWithBand {
+    fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+        let matcher = ArgMatcher::new(
+            vec![ArgMatcher::is_raster(), ArgMatcher::is_integer()],
+            SedonaType::Arrow(DataType::Utf8),
+        );
+        matcher.match_args(args)
+    }
+
+    fn invoke_batch(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+    ) -> Result<ColumnarValue> {
+        let executor = RasterExecutor::new(arg_types, args);
+        let band_index_array = args[1].clone().cast_to(&DataType::Int32, None)?;
+        let band_index_array = band_index_array.into_array(executor.num_iterations())?;
+        let band_index_array = as_int32_array(&band_index_array)?;
+
+        let mut builder =
+            StringBuilder::with_capacity(executor.num_iterations(), executor.num_iterations() * 20);
+        let mut band_index_iter = band_index_array.iter();
+        executor.execute_raster_void(|_, raster_opt| {
+            let band_index = band_index_iter.next().unwrap().unwrap_or(1);
+            get_pixel_type(raster_opt, band_index, &mut builder)
+        })?;
+
+        executor.finish(Arc::new(builder.finish()))
+    }
+}
+
+fn get_pixel_type(
+    raster_opt: Option<&sedona_raster::array::RasterRefImpl<'_>>,
+    band_index: i32,
+    builder: &mut StringBuilder,
+) -> Result<()> {
+    match raster_opt {
+        None => {
+            builder.append_null();
+            Ok(())
+        }
+        Some(raster) => {
+            let num_bands = raster.num_bands();
+            if band_index < 1 || band_index > num_bands as i32 {
+                builder.append_null();
+                return Ok(());
+            }
+            // `band_index` is 1-based (validated >= 1 above); `band` is 0-based.
+            let band = raster.band(band_index as usize - 1)?;
+            let dt = band.data_type();
+            builder.append_value(dt.pixel_type_name());
+            Ok(())
+        }
+    }
+}
+
+// ===========================================================================
+// RS_BandNoDataValue
+// ===========================================================================
+
+/// RS_BandNoDataValue() scalar UDF implementation
+///
+/// Returns the nodata value of the specified band as a Float64.
+/// Returns null if the band has no nodata value defined.
+/// Accepts an optional band_index parameter (1-based, default is 1).
+pub fn rs_bandnodatavalue_udf() -> SedonaScalarUDF {
+    SedonaScalarUDF::new(
+        "rs_bandnodatavalue",
+        vec![
+            Arc::new(RsBandNoDataValue {}),
+            Arc::new(RsBandNoDataValueWithBand {}),
+        ],
+        Volatility::Immutable,
+    )
+}
+
+#[derive(Debug)]
+struct RsBandNoDataValue {}
+
+impl SedonaScalarKernel for RsBandNoDataValue {
+    fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+        let matcher = ArgMatcher::new(
+            vec![ArgMatcher::is_raster()],
+            SedonaType::Arrow(DataType::Float64),
+        );
+        matcher.match_args(args)
+    }
+
+    fn invoke_batch(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+    ) -> Result<ColumnarValue> {
+        let executor = RasterExecutor::new(arg_types, args);
+        let mut builder = Float64Builder::with_capacity(executor.num_iterations());
+
+        executor
+            .execute_raster_void(|_i, raster_opt| get_nodata_value(raster_opt, 1, &mut builder))?;
+
+        executor.finish(Arc::new(builder.finish()))
+    }
+}
+
+#[derive(Debug)]
+struct RsBandNoDataValueWithBand {}
+
+impl SedonaScalarKernel for RsBandNoDataValueWithBand {
+    fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+        let matcher = ArgMatcher::new(
+            vec![ArgMatcher::is_raster(), ArgMatcher::is_integer()],
+            SedonaType::Arrow(DataType::Float64),
+        );
+        matcher.match_args(args)
+    }
+
+    fn invoke_batch(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+    ) -> Result<ColumnarValue> {
+        let executor = RasterExecutor::new(arg_types, args);
+        let band_index_array = args[1].clone().cast_to(&DataType::Int32, None)?;
+        let band_index_array = band_index_array.into_array(executor.num_iterations())?;
+        let band_index_array = as_int32_array(&band_index_array)?;
+
+        let mut builder = Float64Builder::with_capacity(executor.num_iterations());
+        let mut band_index_iter = band_index_array.iter();
+        executor.execute_raster_void(|_, raster_opt| {
+            let band_index = band_index_iter.next().unwrap().unwrap_or(1);
+            get_nodata_value(raster_opt, band_index, &mut builder)
+        })?;
+
+        executor.finish(Arc::new(builder.finish()))
+    }
+}
+
+fn get_nodata_value(
+    raster_opt: Option<&sedona_raster::array::RasterRefImpl<'_>>,
+    band_index: i32,
+    builder: &mut Float64Builder,
+) -> Result<()> {
+    match raster_opt {
+        None => {
+            builder.append_null();
+            Ok(())
+        }
+        Some(raster) => {
+            let num_bands = raster.num_bands();
+            if band_index < 1 || band_index > num_bands as i32 {
+                builder.append_null();
+                return Ok(());
+            }
+            // `band_index` is 1-based (validated >= 1 above); `band` is 0-based.
+            let band = raster.band(band_index as usize - 1)?;
+            match band.nodata_as_f64()? {
+                None => builder.append_null(),
+                Some(val) => builder.append_value(val),
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
+    use datafusion_expr::ScalarUDF;
+    use sedona_schema::datatypes::RASTER;
+    use sedona_schema::raster::BandDataType;
+    use sedona_testing::compare::assert_array_equal;
+    use sedona_testing::raster_spec::RasterSpec;
+    use sedona_testing::rasters::generate_test_rasters;
+    use sedona_testing::testers::ScalarUdfTester;
+
+    /// A 2x2 raster with 3 bands of different types:
+    /// UInt8 (nodata=255), UInt16 (nodata=0), Float32 (no nodata).
+    fn multi_band_spec() -> RasterSpec {
+        RasterSpec::d2(2, 2)
+            .band(BandDataType::UInt8)
+            .nodata(255u8)
+            .band(BandDataType::UInt16)
+            .nodata(0u16)
+            .band(BandDataType::Float32)
+    }
+
+    // -----------------------------------------------------------------------
+    // RS_BandPixelType tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn udf_bandpixeltype_metadata() {
+        let udf: ScalarUDF = rs_bandpixeltype_udf().into();
+        assert_eq!(udf.name(), "rs_bandpixeltype");
+    }
+
+    #[test]
+    fn udf_bandpixeltype_default_band() {
+        let udf: ScalarUDF = rs_bandpixeltype_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER]);
+        tester.assert_return_type(DataType::Utf8);
+
+        // generate_test_rasters creates UInt16 bands
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let result = tester.invoke_array(Arc::new(rasters)).unwrap();
+        let string_array = result
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray");
+
+        assert_eq!(string_array.value(0), "UNSIGNED_16BITS");
+        assert!(string_array.is_null(1));
+        assert_eq!(string_array.value(2), "UNSIGNED_16BITS");
+    }
+
+    #[test]
+    fn udf_bandpixeltype_with_band() {
+        let udf: ScalarUDF = rs_bandpixeltype_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Int32)]);
+
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let band_indices = Int32Array::from(vec![1, 1, 1]);
+        let result = tester
+            .invoke_arrays(vec![Arc::new(rasters), Arc::new(band_indices)])
+            .unwrap();
+        let string_array = result
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray");
+
+        assert_eq!(string_array.value(0), "UNSIGNED_16BITS");
+        assert!(string_array.is_null(1));
+        assert_eq!(string_array.value(2), "UNSIGNED_16BITS");
+    }
+
+    #[test]
+    fn udf_bandpixeltype_with_int64_band() {
+        let udf: ScalarUDF = rs_bandpixeltype_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Int64)]);
+
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let band_indices = Int64Array::from(vec![1i64, 1, 1]);
+        let result = tester
+            .invoke_arrays(vec![Arc::new(rasters), Arc::new(band_indices)])
+            .unwrap();
+        let string_array = result
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray");
+
+        assert_eq!(string_array.value(0), "UNSIGNED_16BITS");
+        assert!(string_array.is_null(1));
+        assert_eq!(string_array.value(2), "UNSIGNED_16BITS");
+    }
+
+    #[test]
+    fn udf_bandpixeltype_non_existing_band() {
+        let udf: ScalarUDF = rs_bandpixeltype_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Int32)]);
+
+        let rasters = generate_test_rasters(1, None).unwrap();
+        let band_indices = Int32Array::from(vec![5]); // out of range
+        let result = tester
+            .invoke_arrays(vec![Arc::new(rasters), Arc::new(band_indices)])
+            .unwrap();
+        assert!(result.is_null(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // RS_BandNoDataValue tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn udf_bandnodatavalue_metadata() {
+        let udf: ScalarUDF = rs_bandnodatavalue_udf().into();
+        assert_eq!(udf.name(), "rs_bandnodatavalue");
+    }
+
+    #[test]
+    fn udf_bandnodatavalue_default_band() {
+        let udf: ScalarUDF = rs_bandnodatavalue_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER]);
+        tester.assert_return_type(DataType::Float64);
+
+        // generate_test_rasters creates bands with nodata = [0, 0] (UInt16 = 0)
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let expected: Arc<dyn arrow_array::Array> =
+            Arc::new(Float64Array::from(vec![Some(0.0), None, Some(0.0)]));
+        let result = tester.invoke_array(Arc::new(rasters)).unwrap();
+        assert_array_equal(&result, &expected);
+    }
+
+    #[test]
+    fn udf_bandnodatavalue_with_int64_band() {
+        let udf: ScalarUDF = rs_bandnodatavalue_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Int64)]);
+
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let band_indices = Int64Array::from(vec![1i64, 1, 1]);
+        let expected: Arc<dyn arrow_array::Array> =
+            Arc::new(Float64Array::from(vec![Some(0.0), None, Some(0.0)]));
+        let result = tester
+            .invoke_arrays(vec![Arc::new(rasters), Arc::new(band_indices)])
+            .unwrap();
+        assert_array_equal(&result, &expected);
+    }
+
+    #[test]
+    fn udf_bandnodatavalue_no_nodata() {
+        let udf: ScalarUDF = rs_bandnodatavalue_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER]);
+
+        // A band without a nodata value yields null.
+        let spec = RasterSpec::d2(2, 2).band_values(&[1u8, 2, 3, 4]);
+        let result = tester.invoke_raster_array(vec![Some(spec)]).unwrap();
+        let float_array = result
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Expected Float64Array");
+        assert!(float_array.is_null(0));
+    }
+
+    #[test]
+    fn udf_bandpixeltype_multi_band() {
+        let udf: ScalarUDF = rs_bandpixeltype_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Int32)]);
+
+        for (band, expected) in [
+            (1_i32, "UNSIGNED_8BITS"),
+            (2, "UNSIGNED_16BITS"),
+            (3, "REAL_32BITS"),
+        ] {
+            let result = tester
+                .invoke_raster_array_scalar(vec![Some(multi_band_spec())], band)
+                .unwrap();
+            let arr = result.as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(arr.value(0), expected);
+        }
+    }
+
+    #[test]
+    fn udf_bandnodatavalue_multi_band() {
+        let udf: ScalarUDF = rs_bandnodatavalue_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Int32)]);
+
+        for (band, expected) in [(1_i32, Some(255.0)), (2, Some(0.0)), (3, None)] {
+            let result = tester
+                .invoke_raster_array_scalar(vec![Some(multi_band_spec())], band)
+                .unwrap();
+            let expected: Arc<dyn Array> = Arc::new(Float64Array::from(vec![expected]));
+            assert_array_equal(&result, &expected);
+        }
+    }
+
+    #[test]
+    fn udf_bandnodatavalue_non_existing_band() {
+        let udf: ScalarUDF = rs_bandnodatavalue_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Int32)]);
+        tester.assert_return_type(DataType::Float64);
+
+        // generate_test_rasters creates bands with nodata = [0, 0] (UInt16 = 0)
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let bands = Int32Array::from(vec![0, 1, 2]); // out of range band index
+        let result = tester
+            .invoke_array_array(Arc::new(rasters), Arc::new(bands))
+            .unwrap();
+        assert!(result.is_null(0));
+        assert!(result.is_null(1));
+        assert!(result.is_null(2));
+    }
+}

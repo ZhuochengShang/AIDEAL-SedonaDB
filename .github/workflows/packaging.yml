@@ -1,0 +1,239 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: packaging
+
+on:
+  push:
+    branches:
+      - main
+      - 'branch-*'
+    tags:
+        - 'apache-sedona-db-*-rc*'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  # At s2geometry updated to 0.13.0
+  VCPKG_REF: 580d480f750618f8affeb77abbb956e6eeaee0ce
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: 'true'
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Prepare dev version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # In the case of a tag, the version in Cargo.toml is already correct
+            VERSION=${GITHUB_REF_NAME#apache-sedona-db-}
+            VERSION=${VERSION%-rc*}
+          elif [[ "${GITHUB_REF##*/}" =~ ^branch-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            VERSION="${GITHUB_REF##*/branch-}"
+          else
+            # Set an alpha version and save it to env
+            VERSION=$(python ci/scripts/set_dev_version.py)
+          fi
+
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Create archive
+        shell: bash
+        run: |
+          ci/scripts/build-source.sh \
+            apache-sedona-db-${VERSION} \
+            $(git log -n 1 --format=%h)
+
+      - name: Run Release Audit Tool
+        shell: bash
+        run: |
+          dev/release/run-rat.sh apache-sedona-db-${{ env.VERSION }}.tar.gz
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: source
+          retention-days: 7
+          path: |
+            apache-sedona-db-${{ env.VERSION }}.tar.gz
+
+  docs-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: 0
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: 'true'
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - uses: quarto-dev/quarto-actions/setup@v2
+
+      - name: Clone vcpkg
+        uses: actions/checkout@v7
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_REF }}
+          path: vcpkg
+
+      - name: Set up environment variables and bootstrap vcpkg
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+          CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+        run: |
+          cd vcpkg
+          ./bootstrap-vcpkg.sh
+          cd ..
+
+          echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
+          echo "PATH=$VCPKG_ROOT:$PATH" >> $GITHUB_ENV
+          echo "CMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE" >> $GITHUB_ENV
+
+      - name: Cache vcpkg binaries
+        id: cache-vcpkg
+        uses: actions/cache@v6
+        with:
+          path: vcpkg/packages
+          # Bump the number at the end of this line to force a new dependency build
+          key: vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-3
+
+      - name: Install vcpkg dependencies
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        run: |
+          ./vcpkg/vcpkg install abseil openssl
+
+      - name: Use stable Rust
+        id: rust
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+
+      - name: Install dependencies
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y libgeos-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Update this key to force a new cache (but share with the python.yml workflow)
+          prefix-key: "python-v3"
+
+      - name: Install docs requirements
+        run: |
+            pip install -r docs/requirements.txt
+
+      - name: Install dev SedonaDB Python
+        env:
+          MATURIN_PEP517_ARGS: "--features s2geography,pyo3/extension-module"
+        run: |
+            pip install "python/sedonadb-expr" -v
+            pip install "python/sedonadb/[geopandas]" -v
+            # sedonadb-zarr is a pure Rust + pyo3 extension (no s2geography
+            # feature). It's installed so mkdocstrings can import it to build
+            # the Zarr extension API reference. Unset the sedonadb-only maturin
+            # args first so they don't leak into the extension build.
+            unset MATURIN_PEP517_ARGS
+            pip install "python/sedonadb-zarr/" -v
+
+      - name: Validate SQL function docs coverage
+        run: |
+          cargo run -p sedona-cli -- list-functions | ci/scripts/check_sql_function_docs.py -
+
+      - name: Build documentation
+        run: |
+          ci/scripts/build-docs.sh
+
+      - name: Compress docs
+        run: |
+          cp -R site sedona-db-docs
+          tar -czf docs.tgz sedona-db-docs
+
+      - name: Upload docs
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs
+          retention-days: 2
+          path: |
+            docs.tgz
+
+      - name: Deploy the doc to the website branch
+        if: ${{ github.event_name != 'pull_request' && github.repository == 'apache/sedona-db' }}
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git fetch origin asf-site --depth=1
+
+          if [[ "${GITHUB_REF##*/}" == "main" ]]; then
+            mike deploy latest-snapshot -b asf-site -p
+          elif [[ "${GITHUB_REF##*/}" =~ ^branch-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            version="${GITHUB_REF##*/branch-}"
+            mike deploy --update-aliases "$version" latest -b asf-site -p
+            mike set-default latest -b asf-site -p
+          fi
+
+  create-release:
+    runs-on: ubuntu-latest
+    needs:
+      - docs-and-deploy
+      - source
+    permissions:
+      contents: write
+
+    steps:
+      - name: Get all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-artifacts
+
+      - name: List release artifacts
+        run: |
+          find release-artifacts -type f
+
+      - name: Create release
+        if: success() && startsWith(github.ref, 'refs/tags/')
+        run: |
+          RELEASE_TAG=${GITHUB_REF#refs/*/}
+          UPLOAD=$(find release-artifacts -type f)
+
+          gh release create "${RELEASE_TAG}" \
+            --repo ${{ github.repository }} \
+            --prerelease \
+            --title "SedonaDB ${RELEASE_TAG}" \
+            ${UPLOAD}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

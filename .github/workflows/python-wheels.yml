@@ -1,0 +1,390 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+name: python-wheels
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'ci/scripts/wheels-*'
+      - '.github/workflows/python-wheels.yml'
+      - '.github/workflows/wheels-expr.yml'
+      - '.github/workflows/wheels-geopandas.yml'
+      - '.github/workflows/wheels-zarr.yml'
+      - '.github/actions/setup-wheel-build/**'
+  push:
+    branches:
+      - main
+      - 'branch-**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  # At s2geometry updated to 0.13.0
+  VCPKG_REF: 580d480f750618f8affeb77abbb956e6eeaee0ce
+
+jobs:
+  windows-x86_64:
+    runs-on: windows-2022
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'true'
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-wheel-build
+        with:
+          rust-cache-key: "python-wheel-windows-latest-v3"
+          delvewheel: "true"
+
+      - name: Clone vcpkg
+        uses: actions/checkout@v7
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_REF }}
+          path: vcpkg
+
+      # Persist vcpkg's built binaries across runs. The pinned VCPKG_REF and
+      # custom triplets fully determine what gets built, so a hit turns the
+      # ~40-minute `vcpkg install` into a seconds-long unpack. Restore and save
+      # are split so the cache is written even when the build/test step fails —
+      # a failing build still produces reusable binaries, and the combined
+      # cache action skips its save on job failure.
+      - name: Restore vcpkg binaries
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-bincache
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-${{ hashFiles('ci/scripts/custom-triplets/**', 'ci/scripts/wheels-build-windows.ps1') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-
+
+      - name: Build and test wheels (sedonadb)
+        run: |
+          Remove-Item -Force .test_failed -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
+          cd ci/scripts
+          .\wheels-build-windows.ps1
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+          VCPKG_DEFAULT_TRIPLET: x64-windows-dynamic-release
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-bincache
+          CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          CIBW_BUILD: "*-win_amd64"
+          CIBW_TEST_REQUIRES: pytest adbc_driver_manager geoarrow-pyarrow geopandas
+          # Test command exits 0 even on failure so CIBW continues building all wheels;
+          # failures are recorded in .test_failed and checked after upload.
+          # We use Python here to be absolutely sure there are no shell escaping issues.
+          CIBW_TEST_COMMAND: >-
+            python -c "import subprocess,sys,pathlib; proj=pathlib.Path(r'{project}'); r=subprocess.run([sys.executable,'-m','pytest',str(pathlib.Path(r'{package}')/'tests'),'-vv','-o','faulthandler_timeout=600']); r.returncode and (print(f'Tests failed (exit {r.returncode}), creating .test_failed marker at {proj.absolute()}') or (proj/'.test_failed').touch() or True); sys.exit(0)"
+
+      # Save even on failure (hence a standalone save step gated only on a miss):
+      # binaries built before a later test failure stay cached for the next run.
+      - name: Save vcpkg binaries
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-bincache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-wheels-windows-x86_64
+          path: python/sedonadb/dist/*.whl
+
+      - name: Fail if tests failed
+        run: python -c "import sys,pathlib; f=pathlib.Path('.test_failed'); print(f'Checking for {f.absolute()}, exists={f.exists()}'); sys.exit(1 if f.exists() else 0)"
+
+  macOS-arm64:
+    runs-on: macOS-latest
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'true'
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-wheel-build
+        with:
+          rust-cache-key: "python-wheel-macOS-latest-v2"
+          cache-bin: "false"
+
+      - name: Clone vcpkg
+        uses: actions/checkout@v7
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_REF }}
+          path: vcpkg
+
+      # Persist vcpkg's built binaries across runs. The pinned VCPKG_REF and
+      # custom triplets fully determine what gets built, so a hit turns the
+      # ~40-minute `vcpkg install` into a seconds-long unpack. Restore and save
+      # are split so the cache is written even when the build/test step fails —
+      # a failing build still produces reusable binaries, and the combined
+      # cache action skips its save on job failure.
+      - name: Restore vcpkg binaries
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-bincache
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-${{ hashFiles('ci/scripts/custom-triplets/**', 'ci/scripts/wheels-bootstrap-vcpkg.sh') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-
+
+      - name: Build and test wheels (sedonadb)
+        run: |
+          rm -f .test_failed
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          cd ci/scripts
+          ./wheels-build-macos.sh sedonadb
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-bincache
+          CIBW_TEST_REQUIRES: pytest adbc_driver_manager geoarrow-pyarrow geopandas duckdb
+          # Test command exits 0 even on failure so CIBW continues building all wheels;
+          # failures are recorded in .test_failed and checked after upload.
+          CIBW_TEST_COMMAND: "pytest {package}/tests -vv -o faulthandler_timeout=600 || touch {project}/.test_failed"
+
+      - name: Save vcpkg binaries
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-bincache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-wheels-macOS-arm64
+          path: python/sedonadb/dist/*.whl
+
+      - name: Fail if tests failed
+        run: test ! -f .test_failed
+
+  macOS-amd64:
+    runs-on: macos-15-intel
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'true'
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-wheel-build
+        with:
+          rust-cache-key: "python-wheel-macOS-latest-v2"
+          cache-bin: "false"
+
+      - name: Clone vcpkg
+        uses: actions/checkout@v7
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_REF }}
+          path: vcpkg
+
+      # Persist vcpkg's built binaries across runs. The pinned VCPKG_REF and
+      # custom triplets fully determine what gets built, so a hit turns the
+      # ~40-minute `vcpkg install` into a seconds-long unpack. Restore and save
+      # are split so the cache is written even when the build/test step fails —
+      # a failing build still produces reusable binaries, and the combined
+      # cache action skips its save on job failure.
+      - name: Restore vcpkg binaries
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-bincache
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-${{ hashFiles('ci/scripts/custom-triplets/**', 'ci/scripts/wheels-bootstrap-vcpkg.sh') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-
+
+      - name: Build and test wheels (sedonadb)
+        run: |
+          rm -f .test_failed
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          cd ci/scripts
+          ./wheels-build-macos.sh sedonadb
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-bincache
+          CIBW_TEST_REQUIRES: pytest adbc_driver_manager geoarrow-pyarrow geopandas duckdb
+          # Test command exits 0 even on failure so CIBW continues building all wheels;
+          # failures are recorded in .test_failed and checked after upload.
+          CIBW_TEST_COMMAND: "pytest {package}/tests -vv -o faulthandler_timeout=600 || touch {project}/.test_failed"
+          SEDONADB_MACOS_ARCH: x86_64
+
+      - name: Save vcpkg binaries
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-bincache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-wheels-macOS-amd64
+          path: python/sedonadb/dist/*.whl
+
+      - name: Fail if tests failed
+        run: test ! -f .test_failed
+
+  wheels-linux:
+    name: ${{ matrix.config.label }}
+    runs-on: ${{ matrix.config.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {os: "ubuntu-latest", label: "linux-x86_64", arch: "x86_64"}
+          - {os: "ubuntu-24.04-arm", label: "linux-arm64", arch: "aarch64"}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'true'
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-wheel-build
+
+      # Persist vcpkg's built binaries across runs. vcpkg runs inside the
+      # manylinux container, so wheels-build-linux.sh bind-mounts this host
+      # directory in and points VCPKG_DEFAULT_BINARY_CACHE at it; a hit turns
+      # the from-source `vcpkg install` into a seconds-long unpack. Restore and
+      # save are split so the cache is written even when the build/test step
+      # fails, and the combined cache action skips its save on job failure.
+      - name: Restore vcpkg binaries
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-bincache
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-${{ hashFiles('ci/scripts/custom-triplets/**', 'ci/scripts/wheels-bootstrap-vcpkg.sh') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-
+
+      - name: Build and test wheels (sedonadb)
+        run: |
+          rm -f .test_failed
+          cd ci/scripts
+          ./wheels-build-linux.sh ${{ matrix.config.arch }} sedonadb
+        env:
+          CIBW_SKIP: "*musllinux*"
+          VCPKG_BINARY_CACHE_HOST: ${{ github.workspace }}/vcpkg-bincache
+          HOST_WORKSPACE: ${{ github.workspace }}
+          CIBW_TEST_REQUIRES: pytest adbc_driver_manager geoarrow-pyarrow geopandas duckdb
+          # Test command exits 0 even on failure so CIBW continues building all wheels;
+          # failures are recorded in .test_failed and checked after upload. The
+          # marker goes to the bind-mounted /host-workspace rather than {project}:
+          # cibuildwheel copies the project into the container, so a marker
+          # written there would be discarded and the gate would pass silently.
+          CIBW_TEST_COMMAND: "pytest {package}/tests -vv -o faulthandler_timeout=600 || touch /host-workspace/.test_failed"
+
+      - name: Save vcpkg binaries
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-bincache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-wheels-${{ matrix.config.label }}
+          path: python/sedonadb/dist/*.whl
+
+      - name: Fail if tests failed
+        run: test ! -f .test_failed
+
+  # Extension wheels build in their own reusable workflow, gated on the
+  # sedonadb jobs (so they run in the same run and can download those wheels
+  # to test against) but isolated so an extension failure can't block the
+  # core package's nightly. Future extensions follow the same shape.
+  # !cancelled() ensures extensions build even if sedonadb tests failed.
+  expr:
+    needs: ["windows-x86_64", "macOS-arm64", "macOS-amd64", "wheels-linux"]
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/wheels-expr.yml
+    secrets: inherit
+
+  zarr:
+    needs: ["windows-x86_64", "macOS-arm64", "macOS-amd64", "wheels-linux"]
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/wheels-zarr.yml
+    secrets: inherit
+
+  # Follows the expr job rather than the core wheel jobs directly: this package
+  # needs the sedonadb-expr wheel (for the `.geo` accessor) in addition to the
+  # core wheels, and expr already waits on those.
+  #
+  # !cancelled() for the same reason as expr/zarr: without it, a cancelled
+  # platform job upstream skips this one even when expr itself succeeded. The
+  # extra result check keeps the requirement this job actually has — it
+  # downloads expr's wheel artifact, which only exists if expr succeeded.
+  geopandas:
+    needs: ["expr"]
+    if: ${{ !cancelled() && needs.expr.result == 'success' }}
+    uses: ./.github/workflows/wheels-geopandas.yml
+    secrets: inherit
+
+  upload_nightly:
+    needs: ["wheels-linux", "macOS-arm64", "macOS-amd64", "windows-x86_64"]
+    # Publish whatever wheels built, even when some platform jobs fail. A job
+    # that fails to build or test never reaches its upload-artifact step, so the
+    # release-wheels-* artifacts hold only wheels that built and passed their
+    # tests -- one platform's failure no longer blocks the nightly for the rest.
+    # !cancelled() still skips a run superseded by a newer push to the branch.
+    if: ${{ !cancelled() }}
+    name: Upload nightly packages
+    runs-on: "macos-latest"
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Install gemfury client
+        run: |
+          brew tap gemfury/tap
+          brew trust gemfury/tap
+          brew install fury-cli
+          fury --version
+
+      - name: Upload packages to Gemfury
+        if: github.repository == 'apache/sedona-db' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          if [ -z "$(ls -A dist 2>/dev/null)" ]; then
+            echo "No wheels built successfully this run; nothing to upload."
+            exit 0
+          fi
+          echo "Uploading nightly wheels:"
+          ls -1 dist
+          fury push \
+            --api-token=${GEMFURY_PUSH_TOKEN} \
+            --as="sedona-nightlies" \
+            dist/*
+        env:
+          GEMFURY_PUSH_TOKEN: ${{ secrets.GEMFURY_PUSH_TOKEN }}

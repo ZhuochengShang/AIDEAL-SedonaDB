@@ -1,0 +1,396 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use arrow::array::BooleanBufferBuilder;
+use arrow_schema::SchemaRef;
+use sedona_common::{sedona_internal_err, SpatialJoinOptions};
+use sedona_expr::statistics::GeoStatistics;
+use sedona_geometry::interval::{Interval, IntervalTrait};
+use std::sync::Arc;
+
+use crate::index::spatial_index::SpatialIndexRef;
+use crate::index::spatial_index_builder::{SpatialIndexBuilder, SpatialJoinBuildMetrics};
+use crate::refine::{DefaultIndexQueryResultRefinerFactory, IndexQueryResultRefinerFactory};
+use crate::{
+    evaluated_batch::{evaluated_batch_stream::SendableEvaluatedBatchStream, EvaluatedBatch},
+    index::{default_spatial_index::DefaultSpatialIndex, knn_adapter::KnnComponents},
+    spatial_predicate::SpatialPredicate,
+    utils::join_utils::need_produce_result_in_final,
+};
+use async_trait::async_trait;
+use datafusion_common::{utils::proxy::VecAllocExt, Result};
+use datafusion_expr::JoinType;
+use futures::StreamExt;
+use geo_index::rtree::{sort::HilbertSort, RTree, RTreeBuilder, RTreeIndex};
+use parking_lot::Mutex;
+use std::sync::atomic::AtomicUsize;
+
+// Type aliases for better readability
+type SpatialRTree = RTree<f32>;
+type DataIdToBatchPos = Vec<(i32, i32)>;
+type RTreeBuildResult = (SpatialRTree, DataIdToBatchPos);
+
+/// Rough estimate for in-memory size of the rtree per rect in bytes
+const RTREE_MEMORY_ESTIMATE_PER_RECT: usize = 60;
+
+/// Builder for constructing a SpatialIndex from geometry batches.
+///
+/// This builder handles:
+/// 1. Accumulating geometry batches to be indexed
+/// 2. Building the spatial R-tree index
+/// 3. Setting up memory tracking and visited bitmaps
+/// 4. Configuring prepared geometries based on execution mode
+pub struct DefaultSpatialIndexBuilder {
+    schema: SchemaRef,
+    spatial_predicate: SpatialPredicate,
+    options: SpatialJoinOptions,
+    join_type: JoinType,
+    probe_threads_count: usize,
+    metrics: SpatialJoinBuildMetrics,
+    refiner_factory: Arc<dyn IndexQueryResultRefinerFactory>,
+    wraparound: Option<Interval>,
+
+    /// Batches to be indexed
+    indexed_batches: Vec<EvaluatedBatch>,
+
+    /// Statistics for indexed geometries
+    stats: GeoStatistics,
+
+    /// Memory used by the spatial index
+    memory_used: usize,
+}
+
+impl DefaultSpatialIndexBuilder {
+    /// Create a new builder with the given configuration.
+    pub fn new(
+        schema: SchemaRef,
+        spatial_predicate: SpatialPredicate,
+        options: SpatialJoinOptions,
+        join_type: JoinType,
+        probe_threads_count: usize,
+        metrics: SpatialJoinBuildMetrics,
+    ) -> Result<Self> {
+        Ok(Self {
+            schema,
+            spatial_predicate,
+            options,
+            join_type,
+            probe_threads_count,
+            metrics,
+            wraparound: None,
+            refiner_factory: Arc::new(DefaultIndexQueryResultRefinerFactory),
+            indexed_batches: Vec::new(),
+            stats: GeoStatistics::empty(),
+            memory_used: 0,
+        })
+    }
+
+    /// Specify the factory to use when creating a refiner
+    ///
+    /// This can be used by join extensions to provide support for other data types like
+    /// geography.
+    pub fn with_refiner_factory(
+        mut self,
+        refiner_factory: Arc<dyn IndexQueryResultRefinerFactory>,
+    ) -> Self {
+        self.refiner_factory = refiner_factory;
+        self
+    }
+
+    /// Specify the absolute bounds of the rectangles that will be inserted into the tree
+    ///
+    /// When set, this must accurately reflect the range of x values in the evaluated
+    /// geometry array's rectangles. This is used by the geography join because those
+    /// rectangles are always within -180..180. When wraparound bounds are encountered,
+    /// this is used to constrain them to finite values in the x direction and insert
+    /// multiple rectangles into the tree.
+    ///
+    /// When self.wraparound is None, inserting wraparound bounds will result in invalid
+    /// results.
+    pub fn with_wraparound(mut self, wraparound: impl Into<Interval>) -> Self {
+        self.wraparound = Some(wraparound.into());
+        self
+    }
+
+    pub fn estimate_extra_memory_usage(
+        geo_stats: &GeoStatistics,
+        spatial_predicate: &SpatialPredicate,
+        options: &SpatialJoinOptions,
+        refiner_factory: Arc<dyn IndexQueryResultRefinerFactory>,
+    ) -> usize {
+        // Estimate the amount of memory needed by the refiner
+        let num_geoms = geo_stats.total_geometries().unwrap_or(0) as usize;
+        let Ok(refiner) = refiner_factory.create_refiner(
+            spatial_predicate,
+            options.clone(),
+            num_geoms,
+            geo_stats.clone(),
+        ) else {
+            // A refiner that fails to construct also consumes no memory
+            return 0;
+        };
+
+        let refiner_mem_usage = refiner.estimate_max_memory_usage(geo_stats);
+
+        let knn_components_mem_usage =
+            if matches!(spatial_predicate, SpatialPredicate::KNearestNeighbors(_)) {
+                KnnComponents::estimate_max_memory_usage(geo_stats)
+            } else {
+                0
+            };
+
+        // Estimate the amount of memory needed for the R-tree
+        let rtree_mem_usage = num_geoms * RTREE_MEMORY_ESTIMATE_PER_RECT;
+
+        // The final estimation is the sum of all above
+        refiner_mem_usage + knn_components_mem_usage + rtree_mem_usage
+    }
+
+    /// Build the spatial R-tree index from collected geometry batches.
+    fn build_rtree(&mut self) -> Result<RTreeBuildResult> {
+        let build_timer = self.metrics.build_time.timer();
+
+        // Each item will add 0 (empty), 1 (regular) or 2 (wraparound)
+        // rectangles to the index.
+        let mut wraparound_count = 0;
+        let num_rects = self
+            .indexed_batches
+            .iter()
+            .flat_map(|batch| batch.geom_array.rects().iter())
+            .map(|rect| {
+                if rect.is_empty() {
+                    0
+                } else if rect.is_wraparound() {
+                    wraparound_count += 1;
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum();
+
+        let mut rtree_builder = RTreeBuilder::<f32>::new(num_rects as u32);
+        let mut batch_pos_vec = vec![(-1, -1); num_rects];
+
+        // Check that if we did have wraparounds we have wraparound bounds against which
+        // to intersect them to get finite rectangles for the tree.
+        let wraparound = self.wraparound.unwrap_or(Interval::empty());
+        if self.wraparound.is_none() && wraparound_count > 0 {
+            return sedona_internal_err!(
+                "Spatial index wraparound hint was None but evaluated arrays contained wraparounds"
+            );
+        }
+
+        let mut num_added = 0;
+        for (batch_idx, batch) in self.indexed_batches.iter().enumerate() {
+            let rects = batch.geom_array.rects();
+            for (idx, rect) in rects.iter().enumerate() {
+                let (left, right) = rect.split(&wraparound);
+                if !left.is_empty() {
+                    let (x, y) = left.into_inner();
+                    let data_idx = rtree_builder.add(x.0, y.0, x.1, y.1);
+                    batch_pos_vec[data_idx as usize] = (batch_idx as i32, idx as i32);
+                    num_added += 1;
+                }
+
+                if !right.is_empty() {
+                    let (x, y) = right.into_inner();
+                    let data_idx = rtree_builder.add(x.0, y.0, x.1, y.1);
+                    batch_pos_vec[data_idx as usize] = (batch_idx as i32, idx as i32);
+                    num_added += 1;
+                }
+            }
+        }
+
+        // If the wraparound was misconfigured, either left or right may be unexpectedly
+        // empty and the wrong number of rectangles would have been added.
+        if num_added != num_rects {
+            return sedona_internal_err!(
+                "Expected {num_rects} rectangles for RTree build but got {num_added}"
+            );
+        }
+
+        let rtree = rtree_builder.finish::<HilbertSort>();
+        build_timer.done();
+
+        let mem_usage = rtree.metadata().data_buffer_length() + batch_pos_vec.allocated_size();
+        self.record_memory_usage(mem_usage);
+
+        Ok((rtree, batch_pos_vec))
+    }
+
+    /// Build visited bitmaps for tracking left-side indices in outer joins.
+    fn build_visited_bitmaps(&mut self) -> Result<Option<Mutex<Vec<BooleanBufferBuilder>>>> {
+        if !need_produce_result_in_final(self.join_type) {
+            return Ok(None);
+        }
+
+        let mut bitmaps = Vec::with_capacity(self.indexed_batches.len());
+        let mut total_buffer_size = 0;
+
+        for batch in &self.indexed_batches {
+            let batch_rows = batch.batch.num_rows();
+            let buffer_size = batch_rows.div_ceil(8);
+            total_buffer_size += buffer_size;
+
+            let mut bitmap = BooleanBufferBuilder::new(batch_rows);
+            bitmap.append_n(batch_rows, false);
+            bitmaps.push(bitmap);
+        }
+
+        self.record_memory_usage(total_buffer_size);
+
+        Ok(Some(Mutex::new(bitmaps)))
+    }
+
+    /// Create an rtree data index to consecutive index mapping.
+    fn build_geom_idx_vec(&mut self, batch_pos_vec: &Vec<(i32, i32)>) -> Vec<usize> {
+        let mut num_geometries = 0;
+        let mut batch_idx_offset = Vec::with_capacity(self.indexed_batches.len() + 1);
+        batch_idx_offset.push(0);
+        for batch in &self.indexed_batches {
+            num_geometries += batch.batch.num_rows();
+            batch_idx_offset.push(num_geometries);
+        }
+
+        let mut geom_idx_vec = Vec::with_capacity(batch_pos_vec.len());
+        self.record_memory_usage(geom_idx_vec.allocated_size());
+
+        for (batch_idx, row_idx) in batch_pos_vec {
+            // Convert (batch_idx, row_idx) to a linear, sequential index
+            let batch_offset = batch_idx_offset[*batch_idx as usize];
+            let prepared_idx = batch_offset + *row_idx as usize;
+            geom_idx_vec.push(prepared_idx);
+        }
+
+        geom_idx_vec
+    }
+
+    fn record_memory_usage(&mut self, bytes: usize) {
+        self.memory_used += bytes;
+        self.metrics.build_mem_used.set_max(self.memory_used);
+    }
+
+    fn add_batch(&mut self, indexed_batch: EvaluatedBatch) -> Result<()> {
+        let in_mem_size = indexed_batch.in_mem_size()?;
+        self.indexed_batches.push(indexed_batch);
+        self.record_memory_usage(in_mem_size);
+        Ok(())
+    }
+    /// Add a geometry batch to be indexed.
+    /// This method accumulates geometry batches that will be used to build the spatial index.
+    /// Each batch contains processed geometry data along with memory usage information.
+    // fn add_batch(&mut self, indexed_batch: EvaluatedBatch) -> Result<()>;
+    /// Merge the provided GeoStatistics with the statistics of the batches added so far.
+    fn merge_stats(&mut self, stats: GeoStatistics) -> &mut Self {
+        self.stats.merge(&stats);
+        self
+    }
+}
+
+#[async_trait]
+impl SpatialIndexBuilder for DefaultSpatialIndexBuilder {
+    fn finish(&mut self) -> Result<SpatialIndexRef> {
+        if self.indexed_batches.is_empty() {
+            // Match GPUSpatialIndexBuilder's empty-index path: outer joins still need a
+            // configured (empty) visited-build bitmap.
+            let visited_build_side = self.build_visited_bitmaps()?;
+            let empty_refiner = self.refiner_factory.create_refiner(
+                &self.spatial_predicate,
+                self.options.clone(),
+                0,
+                GeoStatistics::empty(),
+            )?;
+
+            return Ok(Arc::new(DefaultSpatialIndex::empty(
+                self.spatial_predicate.clone(),
+                self.schema.clone(),
+                self.options.clone(),
+                empty_refiner,
+                visited_build_side,
+                AtomicUsize::new(self.probe_threads_count),
+            )));
+        }
+
+        let num_geoms = self
+            .indexed_batches
+            .iter()
+            .map(|batch| batch.batch.num_rows())
+            .sum::<usize>();
+
+        let (rtree, batch_pos_vec) = self.build_rtree()?;
+
+        let geom_idx_vec = self.build_geom_idx_vec(&batch_pos_vec);
+        let visited_build_side = self.build_visited_bitmaps()?;
+
+        let refiner = self.refiner_factory.create_refiner(
+            &self.spatial_predicate,
+            self.options.clone(),
+            num_geoms,
+            self.stats.clone(),
+        )?;
+
+        self.record_memory_usage(refiner.estimate_max_memory_usage(&self.stats));
+
+        let cache_size = batch_pos_vec.len();
+        let knn_components_opt = {
+            if matches!(
+                self.spatial_predicate,
+                SpatialPredicate::KNearestNeighbors(_)
+            ) {
+                let knn_components = KnnComponents::new(cache_size, &self.indexed_batches)?;
+                self.record_memory_usage(knn_components.estimated_memory_usage());
+                Some(knn_components)
+            } else {
+                None
+            }
+        };
+
+        log::debug!(
+            "Estimated memory used by spatial index: {}",
+            self.memory_used
+        );
+        Ok(Arc::new(DefaultSpatialIndex::new(
+            self.schema.clone(),
+            self.options.clone(),
+            refiner,
+            rtree,
+            self.wraparound,
+            self.indexed_batches
+                .drain(0..self.indexed_batches.len())
+                .collect(),
+            batch_pos_vec,
+            geom_idx_vec,
+            visited_build_side,
+            AtomicUsize::new(self.probe_threads_count),
+            knn_components_opt,
+        )))
+    }
+
+    async fn add_stream(
+        &mut self,
+        mut stream: SendableEvaluatedBatchStream,
+        geo_statistics: GeoStatistics,
+    ) -> Result<()> {
+        while let Some(batch) = stream.next().await {
+            let indexed_batch = batch?;
+            self.add_batch(indexed_batch)?;
+        }
+        self.merge_stats(geo_statistics);
+        Ok(())
+    }
+}

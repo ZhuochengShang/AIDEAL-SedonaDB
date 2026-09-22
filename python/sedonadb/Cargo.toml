@@ -1,0 +1,78 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[package]
+name = "sedonadb"
+version = { workspace = true }
+publish = false
+edition = "2021"
+
+[lib]
+name = "_lib"
+crate-type = ["cdylib"]
+# Pure Python extension — no Rust API consumers, so skip rustdoc.
+doc = false
+
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+s2geography = ["sedona/s2geography"]
+gpu = ["sedona/gpu"]
+
+[dependencies]
+adbc_core = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+bytes = { workspace = true }
+arrow-array = { workspace = true }
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-execution = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-ffi = { workspace = true }
+futures = { workspace = true }
+pyo3 = { workspace = true }
+sedona = { workspace = true }
+sedona-adbc = { workspace = true }
+sedona-datasource = { workspace = true }
+sedona-extension = { workspace = true }
+sedona-geometry = { workspace = true }
+sedona-expr = { workspace = true }
+sedona-geoparquet = { workspace = true }
+sedona-raster = { workspace = true }
+sedona-schema = { workspace = true }
+sedona-gdal = { workspace = true }
+sedona-proj = { workspace = true }
+sedona-tg = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+mimalloc = { workspace = true, optional = true }
+libmimalloc-sys = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `extension-module` (needed for the real cdylib/wheel build) is only ever
+# added by maturin's own build flags (see pyproject.toml's [tool.maturin]),
+# never by this Cargo.toml -- so `cargo test` builds this crate without it,
+# and `auto-initialize` here is what lets a #[test] embed and drive a real
+# Python interpreter via Python::attach. Confirmed directly: explicitly
+# compiling with `--features pyo3/extension-module` fails to link (undefined
+# libpython symbols), but plain `cargo test`/`cargo test --all-features`
+# (CI's actual invocation) never requests that feature, so the two never
+# collide in practice.
+pyo3 = { workspace = true, features = ["auto-initialize"] }

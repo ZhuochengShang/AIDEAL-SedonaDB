@@ -1,0 +1,332 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::sync::Arc;
+
+use datafusion_common::{metadata::ScalarAndMetadata, Column, ParamValues, Result, ScalarValue};
+use datafusion_expr::{
+    expr::{AggregateFunction, FieldMetadata, NullTreatment, ScalarFunction},
+    BinaryExpr, Cast, Expr, Operator,
+};
+use savvy::{savvy, savvy_err, EnvironmentSexp, NullSexp};
+use sedona::context::SedonaContext;
+
+use crate::{
+    context::InternalContext,
+    ffi::{import_array, import_field},
+};
+
+#[savvy]
+pub struct SedonaDBExpr {
+    pub inner: Expr,
+}
+
+#[savvy]
+impl SedonaDBExpr {
+    fn display(&self) -> savvy::Result<savvy::Sexp> {
+        format!("{}", self.inner).try_into()
+    }
+
+    fn qualified_name(&self) -> savvy::Result<savvy::Sexp> {
+        let (qualifier, name) = self.inner.qualified_name();
+        let mut result = savvy::OwnedStringSexp::new(2)?;
+
+        // Set the qualifier (first element) - NA if None
+        match qualifier {
+            Some(table_ref) => result.set_elt(0, &table_ref.to_string())?,
+            None => result.set_na(0)?,
+        }
+
+        // Set the name (second element)
+        result.set_elt(1, &name)?;
+
+        result.into()
+    }
+
+    fn debug_string(&self) -> savvy::Result<savvy::Sexp> {
+        format!("{:?}", self.inner).try_into()
+    }
+
+    fn alias(&self, name: &str) -> savvy::Result<SedonaDBExpr> {
+        let inner = self.inner.clone().alias_if_changed(name.to_string())?;
+        Ok(Self { inner })
+    }
+
+    fn cast(&self, schema_xptr: savvy::Sexp) -> savvy::Result<SedonaDBExpr> {
+        let field = import_field(schema_xptr)?;
+        if let Some(type_name) = field.extension_type_name() {
+            return Err(savvy_err!(
+                "Can't cast to Arrow extension type '{type_name}'"
+            ));
+        }
+
+        let inner = Expr::Cast(Cast::new(
+            self.inner.clone().into(),
+            field.data_type().clone(),
+        ));
+
+        Ok(Self { inner })
+    }
+
+    fn negate(&self) -> savvy::Result<SedonaDBExpr> {
+        let inner = Expr::Negative(Box::new(self.inner.clone()));
+        Ok(Self { inner })
+    }
+
+    fn is_null(&self) -> savvy::Result<SedonaDBExpr> {
+        let inner = Expr::IsNull(Box::new(self.inner.clone()));
+        Ok(Self { inner })
+    }
+
+    fn not(&self) -> savvy::Result<SedonaDBExpr> {
+        let inner = Expr::Not(Box::new(self.inner.clone()));
+        Ok(Self { inner })
+    }
+
+    fn is_not_null(&self) -> savvy::Result<SedonaDBExpr> {
+        let inner = Expr::IsNotNull(Box::new(self.inner.clone()));
+        Ok(Self { inner })
+    }
+
+    fn variant_name(&self) -> savvy::Result<savvy::Sexp> {
+        self.inner.variant_name().try_into()
+    }
+
+    fn parse_binary(&self) -> savvy::Result<savvy::Sexp> {
+        match &self.inner {
+            Expr::BinaryExpr(e) => {
+                let op = savvy::OwnedStringSexp::try_from_scalar(e.op.to_string())?;
+                let left = SedonaDBExpr {
+                    inner: e.left.as_ref().clone(),
+                };
+                let right = SedonaDBExpr {
+                    inner: e.right.as_ref().clone(),
+                };
+
+                let mut result = savvy::OwnedListSexp::new(3, true)?;
+                result.set_name_and_value(0, "op", op)?;
+                result.set_name_and_value(1, "left", savvy::Sexp::try_from(left)?)?;
+                result.set_name_and_value(2, "right", savvy::Sexp::try_from(right)?)?;
+                result.into()
+            }
+            Expr::ScalarFunction(scalar_function) if scalar_function.args.len() >= 2 => {
+                let op = savvy::OwnedStringSexp::try_from_scalar(scalar_function.name())?;
+                let mut result = savvy::OwnedListSexp::new(4, true)?;
+                let left = SedonaDBExpr {
+                    inner: scalar_function.args[0].clone(),
+                };
+                let right = SedonaDBExpr {
+                    inner: scalar_function.args[1].clone(),
+                };
+                result.set_name_and_value(0, "op", op)?;
+                result.set_name_and_value(1, "left", savvy::Sexp::try_from(left)?)?;
+                result.set_name_and_value(2, "right", savvy::Sexp::try_from(right)?)?;
+                result.set_name_and_value(
+                    3,
+                    "n_other",
+                    savvy::Sexp::try_from(i32::try_from(scalar_function.args.len())? - 2)?,
+                )?;
+                result.into()
+            }
+            _ => Ok(NullSexp.into()),
+        }
+    }
+}
+
+#[savvy]
+pub struct SedonaDBExprFactory {
+    pub ctx: Arc<SedonaContext>,
+}
+
+#[savvy]
+impl SedonaDBExprFactory {
+    fn new(ctx: &InternalContext) -> Self {
+        Self {
+            ctx: ctx.inner.clone(),
+        }
+    }
+
+    fn literal(array_xptr: savvy::Sexp, schema_xptr: savvy::Sexp) -> savvy::Result<SedonaDBExpr> {
+        let (field, array_ref) = import_array(array_xptr, schema_xptr)?;
+        let metadata = if field.metadata().is_empty() {
+            None
+        } else {
+            Some(FieldMetadata::new_from_field(&field))
+        };
+
+        let scalar_value = ScalarValue::try_from_array(&array_ref, 0)?;
+        let inner = Expr::Literal(scalar_value, metadata);
+        Ok(SedonaDBExpr { inner })
+    }
+
+    fn column(&self, name: &str, qualifier: Option<&str>) -> savvy::Result<SedonaDBExpr> {
+        let inner = Expr::Column(Column::new(qualifier, name));
+        Ok(SedonaDBExpr { inner })
+    }
+
+    fn binary(
+        &self,
+        op: &str,
+        lhs: &SedonaDBExpr,
+        rhs: &SedonaDBExpr,
+    ) -> savvy::Result<SedonaDBExpr> {
+        let operator = match op {
+            "==" => Operator::Eq,
+            "!=" => Operator::NotEq,
+            ">" => Operator::Gt,
+            ">=" => Operator::GtEq,
+            "<" => Operator::Lt,
+            "<=" => Operator::LtEq,
+            "+" => Operator::Plus,
+            "-" => Operator::Minus,
+            "*" => Operator::Multiply,
+            "/" => Operator::Divide,
+            "&" => Operator::And,
+            "|" => Operator::Or,
+            other => return Err(savvy_err!("Unimplemented binary operation '{other}'")),
+        };
+
+        let inner = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(lhs.inner.clone()),
+            operator,
+            Box::new(rhs.inner.clone()),
+        ));
+        Ok(SedonaDBExpr { inner })
+    }
+
+    // Wrapper for the case where a function might be aggregate or scalar
+    fn any_function(
+        &self,
+        name: &str,
+        args: savvy::Sexp,
+        na_rm: Option<bool>,
+    ) -> savvy::Result<SedonaDBExpr> {
+        if self
+            .ctx
+            .ctx
+            .state()
+            .aggregate_functions()
+            .contains_key(name)
+            || na_rm.is_some()
+        {
+            self.aggregate_function(name, args, na_rm, None)
+        } else {
+            self.scalar_function(name, args)
+        }
+    }
+
+    fn scalar_function(&self, name: &str, args: savvy::Sexp) -> savvy::Result<SedonaDBExpr> {
+        if let Some(udf) = self.ctx.ctx.state().scalar_functions().get(name) {
+            let args = Self::exprs(args)?;
+            let inner = Expr::ScalarFunction(ScalarFunction::new_udf(udf.clone(), args));
+            Ok(SedonaDBExpr { inner })
+        } else {
+            Err(savvy_err!("Scalar UDF '{name}' not found"))
+        }
+    }
+
+    fn aggregate_function(
+        &self,
+        name: &str,
+        args: savvy::Sexp,
+        na_rm: Option<bool>,
+        distinct: Option<bool>,
+    ) -> savvy::Result<SedonaDBExpr> {
+        if let Some(udf) = self.ctx.ctx.state().aggregate_functions().get(name) {
+            let args = Self::exprs(args)?;
+            let null_treatment = if na_rm.unwrap_or(false) {
+                NullTreatment::IgnoreNulls
+            } else {
+                NullTreatment::RespectNulls
+            };
+
+            let inner = Expr::AggregateFunction(AggregateFunction::new_udf(
+                udf.clone(),
+                args,
+                distinct.unwrap_or(false),
+                None,   // filter
+                vec![], // order by
+                Some(null_treatment),
+            ));
+
+            Ok(SedonaDBExpr { inner })
+        } else {
+            Err(savvy_err!("Aggregate UDF '{name}' not found"))
+        }
+    }
+}
+
+impl SedonaDBExprFactory {
+    pub fn exprs(exprs_sexp: savvy::Sexp) -> savvy::Result<Vec<Expr>> {
+        savvy::ListSexp::try_from(exprs_sexp)?
+            .iter()
+            .map(|(_, item)| -> savvy::Result<Expr> {
+                // item here is the Environment wrapper around the external pointer
+                let expr_wrapper: &SedonaDBExpr = EnvironmentSexp::try_from(item)?.try_into()?;
+                Ok(expr_wrapper.inner.clone())
+            })
+            .collect()
+    }
+
+    pub fn param_values(exprs_sexp: savvy::Sexp) -> savvy::Result<ParamValues> {
+        let literals = savvy::ListSexp::try_from(exprs_sexp)?
+            .iter()
+            .map(
+                |(name, item)| -> savvy::Result<(String, ScalarAndMetadata)> {
+                    // item here is the Environment wrapper around the external pointer
+                    let expr_wrapper: &SedonaDBExpr =
+                        EnvironmentSexp::try_from(item)?.try_into()?;
+                    if let Expr::Literal(scalar, metadata) = &expr_wrapper.inner {
+                        Ok((
+                            name.to_string(),
+                            ScalarAndMetadata::new(scalar.clone(), metadata.clone()),
+                        ))
+                    } else {
+                        Err(savvy_err!(
+                            "Expected literal expression but got {:?}",
+                            expr_wrapper.inner
+                        ))
+                    }
+                },
+            )
+            .collect::<savvy::Result<Vec<_>>>()?;
+
+        let has_names = literals.iter().any(|(name, _)| !name.is_empty());
+        if literals.is_empty() || has_names {
+            if !literals.iter().all(|(name, _)| !name.is_empty()) {
+                return Err(savvy_err!("params must be all named or all unnamed"));
+            }
+
+            Ok(ParamValues::Map(literals.into_iter().rev().collect()))
+        } else {
+            Ok(ParamValues::List(
+                literals.into_iter().map(|(_, param)| param).collect(),
+            ))
+        }
+    }
+}
+
+impl TryFrom<EnvironmentSexp> for &SedonaDBExpr {
+    type Error = savvy::Error;
+
+    fn try_from(env: EnvironmentSexp) -> Result<Self, Self::Error> {
+        env.get(".ptr")?
+            .map(<&SedonaDBExpr>::try_from)
+            .transpose()?
+            .ok_or(savvy_err!("Invalid SedonaDBExpr object."))
+    }
+}

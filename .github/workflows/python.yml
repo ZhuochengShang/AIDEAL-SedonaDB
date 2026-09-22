@@ -1,0 +1,206 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: python
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/python.yml'
+      - 'rust/**'
+      - 'c/**'
+      - 'python/**'
+      - 'integration/spark-parity/**'
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}-rust
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -l -eo pipefail {0}
+
+env:
+  # At s2geometry updated to 0.13.0
+  VCPKG_REF: 580d480f750618f8affeb77abbb956e6eeaee0ce
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    name: "python ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'true'
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Clone vcpkg
+        uses: actions/checkout@v7
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_REF }}
+          path: vcpkg
+
+      - name: Set up environment variables and bootstrap vcpkg
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+          CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+        run: |
+          cd vcpkg
+          ./bootstrap-vcpkg.sh
+          cd ..
+
+          echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
+          echo "PATH=$VCPKG_ROOT:$PATH" >> $GITHUB_ENV
+          echo "CMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE" >> $GITHUB_ENV
+
+      - name: Cache vcpkg binaries
+        id: cache-vcpkg
+        uses: actions/cache@v6
+        with:
+          path: vcpkg/packages
+          # Bump the number at the end of this line to force a new dependency build
+          key: vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-3
+
+      - name: Install vcpkg dependencies
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        run: |
+          ./vcpkg/vcpkg install abseil openssl
+
+      - name: Use stable Rust
+        id: rust
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+
+      - name: Install dependencies
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y libgeos-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Update this key to force a new cache (sync with packaging.yml)
+          prefix-key: "python-v3"
+
+      - name: Install sedonadb-expr
+        run: |
+          pip install -e "python/sedonadb-expr" -vv
+
+      - name: Install sedonadb
+        run: |
+          # Keep this export in sync with the export in dev/release/verify-release-candidate.sh
+          export MATURIN_PEP517_ARGS="--features s2geography"
+          pip install -e "python/sedonadb/[test]" -vv
+
+      - name: Install sedonadb-zarr
+        run: |
+          pip install -e "python/sedonadb-zarr/[test]" -vv
+
+      # Depends on sedonadb and sedonadb-expr, so this must come after both are
+      # installed from source (otherwise pip would resolve them from PyPI).
+      - name: Install sedonadb-geopandas
+        run: |
+          pip install -e "python/sedonadb-geopandas/[test]" -vv
+
+      - name: Download minimal geoarrow-data assets
+        run: |
+          python submodules/download-assets.py "*water-junc*" "*water-point*"
+
+      - name: Start PostGIS
+        run: |
+          docker compose up --wait --detach postgis
+
+      - name: Run tests (sedonadb)
+        env:
+          # Ensure that we don't skip tests that we didn't intend to
+          SEDONADB_PYTHON_NO_SKIP_TESTS: "true"
+        run: |
+          cd python/sedonadb
+          python -m pytest -vv
+
+      - name: Run doctests (sedonadb)
+        run: |
+          cd python/sedonadb
+          python -m pytest --doctest-modules python/
+
+      - name: Run tests (sedonadb-expr)
+        run: |
+          cd python/sedonadb-expr
+          python -m pytest -vv
+
+      - name: Run tests (sedonadb-geopandas)
+        run: |
+          cd python/sedonadb-geopandas
+          python -m pytest -vv
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Sedona Spark test dependencies
+        run: |
+          # Pinned to the newest Spark minor Sedona publishes a shaded
+          # artifact for (1.9.1 ships 4.0 and 4.1), so CI runs one known
+          # combination. An unpinned install pulled pyspark 4.2.0, whose
+          # function registry rejects the fallback 4.1 jar at
+          # SedonaContext.create. Bump when Sedona ships an artifact for a
+          # newer Spark line.
+          pip install "pyspark==4.1.*" apache-sedona
+
+      - name: Cache Sedona Spark jars
+        uses: actions/cache@v6
+        with:
+          # Matches SEDONADB_SPARK_IVY_DIR below, which SedonaSpark passes to
+          # spark.jars.ivy so Ivy resolves the jars into a fixed directory
+          # regardless of the Ivy version's default.
+          path: ~/.ivy2-spark-parity
+          # testing_spark.py pins SEDONA_SPARK_VERSION and
+          # GEOTOOLS_WRAPPER_VERSION, so the cache invalidates exactly when
+          # the jar pins change.
+          key: spark-parity-jars-${{ runner.os }}-${{ hashFiles('python/sedonadb/python/sedonadb/testing_spark.py') }}
+
+      - name: Run tests (spark-parity)
+        env:
+          SEDONADB_SPARK_IVY_DIR: /home/runner/.ivy2-spark-parity
+        run: |
+          cd integration/spark-parity
+          python -m pytest -vv
+
+      - name: Shutdown docker compose services
+        if: always()
+        run: |
+          docker compose down

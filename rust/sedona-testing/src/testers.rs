@@ -1,0 +1,753 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+use std::{iter::zip, sync::Arc};
+
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
+use arrow_schema::{FieldRef, Schema};
+use datafusion_common::{
+    arrow::compute::kernels::concat::concat, config::ConfigOptions, Result, ScalarValue,
+};
+use datafusion_expr::{
+    function::{AccumulatorArgs, StateFieldsArgs},
+    Accumulator, AggregateUDF, ColumnarValue, EmitTo, Expr, GroupsAccumulator, Literal,
+    ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF,
+};
+use datafusion_physical_expr::{expressions::Column, PhysicalExpr};
+use sedona_common::{sedona_internal_err, SedonaOptions};
+use sedona_geometry::transform::CrsEngine;
+use sedona_schema::datatypes::SedonaType;
+
+use crate::{
+    compare::assert_scalar_equal,
+    create::{create_array, create_scalar},
+    raster_spec::{raster_array, RasterSpec},
+};
+
+/// Low-level tester for aggregate functions
+///
+/// This struct provides a means by which to run a simple check of an
+/// aggregate implementation by approximating one method DataFusion
+/// might use to perform the aggregation. Whereas DataFusion may arrange
+/// various calls to accumulate, state, and update_batch to optimize
+/// for different cases, this tester is always created by aggregating
+/// states that were in turn created from accumulating one batch.
+///
+/// This is not a replacement for testing at a higher level using
+/// DataFusion's actual aggregate implementation but provides
+/// a useful mechanism to ensure all the pieces of an accumulator
+/// are plugged in.
+pub struct AggregateUdfTester {
+    udf: AggregateUDF,
+    arg_types: Vec<SedonaType>,
+    mock_schema: Schema,
+    mock_exprs: Vec<Arc<dyn PhysicalExpr>>,
+}
+
+impl AggregateUdfTester {
+    /// Create a new tester
+    pub fn new(udf: AggregateUDF, arg_types: Vec<SedonaType>) -> Self {
+        let arg_fields = arg_types
+            .iter()
+            .map(|sedona_type| sedona_type.to_storage_field("", true).map(Arc::new))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let mock_schema = Schema::new(arg_fields);
+
+        let mock_exprs = (0..arg_types.len())
+            .map(|i| -> Arc<dyn PhysicalExpr> { Arc::new(Column::new("col", i)) })
+            .collect::<Vec<_>>();
+        Self {
+            udf,
+            arg_types,
+            mock_schema,
+            mock_exprs,
+        }
+    }
+
+    /// Compute the return type
+    pub fn return_type(&self) -> Result<SedonaType> {
+        let out_field = self.udf.return_field(&self.mock_schema.fields)?;
+        SedonaType::from_storage_field(&out_field)
+    }
+
+    /// Perform a simple aggregation using WKT as geometry input
+    pub fn aggregate_wkt(&self, batches: Vec<Vec<Option<&str>>>) -> Result<ScalarValue> {
+        let batches_array = batches
+            .into_iter()
+            .map(|batch| create_array(&batch, &self.arg_types[0]))
+            .collect::<Vec<_>>();
+        self.aggregate(&batches_array)
+    }
+
+    /// Perform a simple aggregation using [RasterSpec]s as raster input
+    /// (`None` entries become null rasters)
+    pub fn aggregate_rasters(&self, batches: Vec<Vec<Option<RasterSpec>>>) -> Result<ScalarValue> {
+        let batches_array = batches
+            .into_iter()
+            .map(|batch| Arc::new(raster_array(batch)) as ArrayRef)
+            .collect::<Vec<_>>();
+        self.aggregate(&batches_array)
+    }
+
+    /// Perform a simple aggregation
+    ///
+    /// Each batch in batches is accumulated with its own accumulator
+    /// and serialized into its own state, after which the states are accumulated
+    /// in batches of one. This has the effect of testing all the pieces of
+    /// an aggregator in a somewhat configurable/predictable way.
+    pub fn aggregate(&self, batches: &Vec<ArrayRef>) -> Result<ScalarValue> {
+        let state_schema = Arc::new(Schema::new(self.state_fields()?));
+        let mut state_accumulator = self.new_accumulator()?;
+
+        for batch in batches {
+            let mut batch_accumulator = self.new_accumulator()?;
+            batch_accumulator.update_batch(std::slice::from_ref(batch))?;
+            let state_batch_of_one = RecordBatch::try_new(
+                state_schema.clone(),
+                batch_accumulator
+                    .state()?
+                    .into_iter()
+                    .map(|v| v.to_array())
+                    .collect::<Result<Vec<_>>>()?,
+            )?;
+            state_accumulator.merge_batch(state_batch_of_one.columns())?;
+        }
+
+        state_accumulator.evaluate()
+    }
+
+    /// Perform a simple grouped aggregation
+    ///
+    /// Each batch in batches is accumulated with its own groups accumulator
+    /// and serialized into its own state, after which the state resulting
+    /// from each batch is merged into the final groups accumulator. This
+    /// has the effect of testing the pieces of a groups accumulator in a
+    /// predictable/debug-friendly (if artificial) way.
+    pub fn aggregate_groups(
+        &self,
+        batches: &Vec<ArrayRef>,
+        group_indices: Vec<usize>,
+        opt_filter: Option<&Vec<bool>>,
+        emit_sizes: Vec<usize>,
+    ) -> Result<ArrayRef> {
+        let state_schema = Arc::new(Schema::new(self.state_fields()?));
+        let mut state_accumulator = self.new_groups_accumulator()?;
+        let total_num_groups = group_indices.iter().max().unwrap_or(&0) + 1;
+
+        // Check input
+        let total_input_rows: usize = batches.iter().map(|a| a.len()).sum();
+        assert_eq!(total_input_rows, group_indices.len());
+        if let Some(filter) = opt_filter {
+            assert_eq!(total_input_rows, filter.len());
+        }
+        if !emit_sizes.is_empty() {
+            assert_eq!(emit_sizes.iter().sum::<usize>(), total_num_groups);
+        }
+
+        let mut offset = 0;
+        for batch in batches {
+            let mut batch_accumulator = self.new_groups_accumulator()?;
+            let opt_filter_array = opt_filter.map(|filter_vec| {
+                filter_vec[offset..(offset + batch.len())]
+                    .iter()
+                    .collect::<BooleanArray>()
+            });
+            batch_accumulator.update_batch(
+                std::slice::from_ref(batch),
+                &group_indices[offset..(offset + batch.len())],
+                opt_filter_array.as_ref(),
+                total_num_groups,
+            )?;
+            offset += batch.len();
+
+            // For the state accumulator the input is ordered such that
+            // each row is group i for i in (0..total_num_groups)
+            let state_batch = RecordBatch::try_new(
+                state_schema.clone(),
+                batch_accumulator.state(datafusion_expr::EmitTo::All)?,
+            )?;
+            state_accumulator.merge_batch(
+                state_batch.columns(),
+                &(0..total_num_groups).collect::<Vec<_>>(),
+                None,
+                total_num_groups,
+            )?;
+        }
+
+        if emit_sizes.is_empty() {
+            state_accumulator.evaluate(datafusion_expr::EmitTo::All)
+        } else {
+            let arrays = emit_sizes
+                .iter()
+                .map(|emit_size| state_accumulator.evaluate(EmitTo::First(*emit_size)))
+                .collect::<Result<Vec<_>>>()?;
+            let arrays_ref = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+            Ok(concat(&arrays_ref)?)
+        }
+    }
+
+    fn new_accumulator(&self) -> Result<Box<dyn Accumulator>> {
+        let accumulator_args = self.accumulator_args()?;
+        self.udf.accumulator(accumulator_args)
+    }
+
+    fn new_groups_accumulator(&self) -> Result<Box<dyn GroupsAccumulator>> {
+        assert!(self
+            .udf
+            .groups_accumulator_supported(self.accumulator_args()?));
+        self.udf.create_groups_accumulator(self.accumulator_args()?)
+    }
+
+    fn accumulator_args(&self) -> Result<AccumulatorArgs<'_>> {
+        Ok(AccumulatorArgs {
+            return_field: self.udf.return_field(self.mock_schema.fields())?,
+            schema: &self.mock_schema,
+            ignore_nulls: true,
+            order_bys: &[],
+            is_reversed: false,
+            name: "",
+            is_distinct: false,
+            exprs: &self.mock_exprs,
+            expr_fields: &[],
+        })
+    }
+
+    fn state_fields(&self) -> Result<Vec<FieldRef>> {
+        let state_field_args = StateFieldsArgs {
+            name: "",
+            input_fields: self.mock_schema.fields(),
+            return_field: self.udf.return_field(self.mock_schema.fields())?,
+            ordering_fields: &[],
+            is_distinct: false,
+        };
+        self.udf.state_fields(state_field_args)
+    }
+}
+
+/// Low-level tester for scalar functions
+///
+/// This struct provides a means by which to run a simple check of an
+/// scalar UDF implementation by simulating how DataFusion might call it.
+///
+/// This is not a replacement for testing at a higher level using DataFusion's
+/// actual implementation but provides a useful mechanism to ensure all the
+/// pieces of an scalar UDF are plugged in.
+///
+/// Note that arguments are always cast to the values passed [Self::new]:
+/// to test different combinations of argument types, use a new tester.
+pub struct ScalarUdfTester {
+    udf: ScalarUDF,
+    arg_types: Vec<SedonaType>,
+    config_options: Arc<ConfigOptions>,
+}
+
+impl ScalarUdfTester {
+    /// Create a new tester
+    pub fn new(udf: ScalarUDF, arg_types: Vec<SedonaType>) -> Self {
+        let mut config_options = ConfigOptions::default();
+        let sedona_options = SedonaOptions::default();
+        config_options.extensions.insert(sedona_options);
+        Self {
+            udf,
+            arg_types,
+            config_options: Arc::new(config_options),
+        }
+    }
+
+    /// Returns the [`ConfigOptions`] used when invoking the UDF.
+    ///
+    /// This is the same structure DataFusion threads through [`ScalarFunctionArgs`].
+    /// Sedona-specific options are stored in `config_options.extensions`.
+    pub fn config_options(&self) -> &ConfigOptions {
+        &self.config_options
+    }
+
+    /// Returns a mutable reference to the [`ConfigOptions`] used when invoking the UDF.
+    ///
+    /// Use this to tweak DataFusion options or to insert/update Sedona options via
+    /// `config_options.extensions` before calling the tester's `invoke_*` helpers.
+    pub fn config_options_mut(&mut self) -> &mut ConfigOptions {
+        // config_options can only be owned by this tester, so it's safe to get a mutable reference.
+        Arc::get_mut(&mut self.config_options).expect("ConfigOptions is shared")
+    }
+
+    /// Returns the [`SedonaOptions`] stored in `config_options.extensions`, if present.
+    pub fn sedona_options(&self) -> &SedonaOptions {
+        self.config_options
+            .extensions
+            .get::<SedonaOptions>()
+            .expect("SedonaOptions does not exist")
+    }
+
+    /// Returns a mutable reference to the [`SedonaOptions`] stored in `config_options.extensions`, if present.
+    pub fn sedona_options_mut(&mut self) -> &mut SedonaOptions {
+        self.config_options_mut()
+            .extensions
+            .get_mut::<SedonaOptions>()
+            .expect("SedonaOptions does not exist")
+    }
+
+    /// Replace the CRS engine in this tester's [`SedonaOptions`].
+    ///
+    /// UDFs that reproject read the engine from the session options; the
+    /// default engine errors on use, so a test exercising a reprojecting
+    /// path adds a real engine crate (e.g. `sedona-proj`) as a
+    /// dev-dependency and passes its engine here.
+    pub fn with_crs_engine(mut self, crs_engine: Arc<dyn CrsEngine + Send + Sync>) -> Self {
+        let options = self.sedona_options_mut();
+        options.runtime = options.runtime.with_crs_engine(crs_engine);
+        self
+    }
+
+    /// Assert the return type of the function for the argument types used
+    /// to construct this tester
+    ///
+    /// Both [SedonaType] or [DataType] objects can be used as the expected
+    /// data type.
+    pub fn assert_return_type(&self, data_type: impl TryInto<SedonaType>) {
+        let expected = match data_type.try_into() {
+            Ok(t) => t,
+            Err(_) => panic!("Failed to convert to SedonaType"),
+        };
+        assert_eq!(self.return_type().unwrap(), expected)
+    }
+
+    /// Assert the result of invoking this function
+    ///
+    /// Both actual and expected are interpreted according to the calculated
+    /// return type (notably, WKT is interpreted as geometry or geography output).
+    pub fn assert_scalar_result_equals(&self, actual: impl Literal, expected: impl Literal) {
+        self.assert_scalar_result_equals_inner(actual, expected, None);
+    }
+
+    /// Assert the result of invoking this function with the return type specified
+    ///
+    /// This is for UDFs implementing `SedonaScalarKernel::return_type_from_args_and_scalars()`.
+    pub fn assert_scalar_result_equals_with_return_type(
+        &self,
+        actual: impl Literal,
+        expected: impl Literal,
+        return_type: SedonaType,
+    ) {
+        self.assert_scalar_result_equals_inner(actual, expected, Some(return_type));
+    }
+
+    fn assert_scalar_result_equals_inner(
+        &self,
+        actual: impl Literal,
+        expected: impl Literal,
+        return_type: Option<SedonaType>,
+    ) {
+        let return_type = return_type.unwrap_or_else(|| self.return_type().unwrap());
+        let actual = Self::scalar_lit(actual, &return_type).unwrap();
+        let expected = Self::scalar_lit(expected, &return_type).unwrap();
+        assert_scalar_equal(&actual, &expected);
+    }
+
+    /// Compute the return type
+    pub fn return_type(&self) -> Result<SedonaType> {
+        let scalar_arguments = vec![None; self.arg_types.len()];
+        self.return_type_with_scalars_inner(&scalar_arguments)
+    }
+
+    /// Compute the return type from one scalar argument
+    ///
+    /// This is for UDFs implementing `SedonaScalarKernel::return_type_from_args_and_scalars()`.
+    pub fn return_type_with_scalar(&self, arg0: Option<impl Literal>) -> Result<SedonaType> {
+        let scalar_arguments = vec![arg0
+            .map(|x| Self::scalar_lit(x, &self.arg_types[0]))
+            .transpose()?];
+        self.return_type_with_scalars_inner(&scalar_arguments)
+    }
+
+    /// Compute the return type from two scalar arguments
+    ///
+    /// This is for UDFs implementing `SedonaScalarKernel::return_type_from_args_and_scalars()`.
+    pub fn return_type_with_scalar_scalar(
+        &self,
+        arg0: Option<impl Literal>,
+        arg1: Option<impl Literal>,
+    ) -> Result<SedonaType> {
+        let scalar_arguments = vec![
+            arg0.map(|x| Self::scalar_lit(x, &self.arg_types[0]))
+                .transpose()?,
+            arg1.map(|x| Self::scalar_lit(x, &self.arg_types[1]))
+                .transpose()?,
+        ];
+        self.return_type_with_scalars_inner(&scalar_arguments)
+    }
+
+    /// Compute the return type from three scalar arguments
+    ///
+    /// This is for UDFs implementing `SedonaScalarKernel::return_type_from_args_and_scalars()`.
+    pub fn return_type_with_scalar_scalar_scalar(
+        &self,
+        arg0: Option<impl Literal>,
+        arg1: Option<impl Literal>,
+        arg2: Option<impl Literal>,
+    ) -> Result<SedonaType> {
+        let scalar_arguments = vec![
+            arg0.map(|x| Self::scalar_lit(x, &self.arg_types[0]))
+                .transpose()?,
+            arg1.map(|x| Self::scalar_lit(x, &self.arg_types[1]))
+                .transpose()?,
+            arg2.map(|x| Self::scalar_lit(x, &self.arg_types[2]))
+                .transpose()?,
+        ];
+        self.return_type_with_scalars_inner(&scalar_arguments)
+    }
+
+    fn return_type_with_scalars_inner(
+        &self,
+        scalar_arguments: &[Option<ScalarValue>],
+    ) -> Result<SedonaType> {
+        let arg_fields = self
+            .arg_types
+            .iter()
+            .map(|sedona_type| sedona_type.to_storage_field("", true).map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+
+        let scalar_arguments_ref: Vec<Option<&ScalarValue>> =
+            scalar_arguments.iter().map(|x| x.as_ref()).collect();
+        let args = ReturnFieldArgs {
+            arg_fields: &arg_fields,
+            scalar_arguments: &scalar_arguments_ref,
+        };
+        let return_field = self.udf.return_field_from_args(args)?;
+        SedonaType::from_storage_field(&return_field)
+    }
+
+    /// Invoke this function with a scalar
+    pub fn invoke_scalar(&self, arg: impl Literal) -> Result<ScalarValue> {
+        let scalar_arg = Self::scalar_lit(arg, &self.arg_types[0])?;
+
+        // Some UDF calculate the return type from the input scalar arguments, so try it first.
+        let return_type = self
+            .return_type_with_scalars_inner(&[Some(scalar_arg.clone())])
+            .ok();
+
+        let args = vec![ColumnarValue::Scalar(scalar_arg)];
+        if let ColumnarValue::Scalar(scalar) = self.invoke_with_return_type(args, return_type)? {
+            Ok(scalar)
+        } else {
+            sedona_internal_err!("Expected scalar result from scalar invoke")
+        }
+    }
+
+    /// Invoke this function with a geometry scalar
+    pub fn invoke_wkb_scalar(&self, wkt_value: Option<&str>) -> Result<ScalarValue> {
+        self.invoke_scalar(create_scalar(wkt_value, &self.arg_types[0]))
+    }
+
+    /// Invoke this function with two scalars
+    pub fn invoke_scalar_scalar<T0: Literal, T1: Literal>(
+        &self,
+        arg0: T0,
+        arg1: T1,
+    ) -> Result<ScalarValue> {
+        let scalar_arg0 = Self::scalar_lit(arg0, &self.arg_types[0])?;
+        let scalar_arg1 = Self::scalar_lit(arg1, &self.arg_types[1])?;
+
+        // Some UDF calculate the return type from the input scalar arguments, so try it first.
+        let return_type = self
+            .return_type_with_scalars_inner(&[Some(scalar_arg0.clone()), Some(scalar_arg1.clone())])
+            .ok();
+
+        let args = vec![
+            ColumnarValue::Scalar(scalar_arg0),
+            ColumnarValue::Scalar(scalar_arg1),
+        ];
+        if let ColumnarValue::Scalar(scalar) = self.invoke_with_return_type(args, return_type)? {
+            Ok(scalar)
+        } else {
+            sedona_internal_err!("Expected scalar result from binary scalar invoke")
+        }
+    }
+
+    /// Invoke this function with three scalars
+    pub fn invoke_scalar_scalar_scalar<T0: Literal, T1: Literal, T2: Literal>(
+        &self,
+        arg0: T0,
+        arg1: T1,
+        arg2: T2,
+    ) -> Result<ScalarValue> {
+        let scalar_arg0 = Self::scalar_lit(arg0, &self.arg_types[0])?;
+        let scalar_arg1 = Self::scalar_lit(arg1, &self.arg_types[1])?;
+        let scalar_arg2 = Self::scalar_lit(arg2, &self.arg_types[2])?;
+
+        // Some UDF calculate the return type from the input scalar arguments, so try it first.
+        let return_type = self
+            .return_type_with_scalars_inner(&[
+                Some(scalar_arg0.clone()),
+                Some(scalar_arg1.clone()),
+                Some(scalar_arg2.clone()),
+            ])
+            .ok();
+
+        let args = vec![
+            ColumnarValue::Scalar(scalar_arg0),
+            ColumnarValue::Scalar(scalar_arg1),
+            ColumnarValue::Scalar(scalar_arg2),
+        ];
+        if let ColumnarValue::Scalar(scalar) = self.invoke_with_return_type(args, return_type)? {
+            Ok(scalar)
+        } else {
+            sedona_internal_err!("Expected scalar result from binary scalar invoke")
+        }
+    }
+
+    /// Invoke this function with a raster scalar built from a [RasterSpec]
+    pub fn invoke_raster_scalar(&self, spec: &RasterSpec) -> Result<ScalarValue> {
+        self.invoke_scalar(spec)
+    }
+
+    /// Invoke this function with a raster array built from [RasterSpec]s
+    /// (`None` entries become null rasters)
+    pub fn invoke_raster_array(&self, specs: Vec<Option<RasterSpec>>) -> Result<ArrayRef> {
+        self.invoke_array(Arc::new(raster_array(specs)))
+    }
+
+    /// Invoke this function with a raster array built from [RasterSpec]s and
+    /// a scalar
+    pub fn invoke_raster_array_scalar(
+        &self,
+        specs: Vec<Option<RasterSpec>>,
+        arg: impl Literal,
+    ) -> Result<ArrayRef> {
+        self.invoke_array_scalar(Arc::new(raster_array(specs)), arg)
+    }
+
+    /// Invoke this function with a geometry array
+    pub fn invoke_wkb_array(&self, wkb_values: Vec<Option<&str>>) -> Result<ArrayRef> {
+        self.invoke_array(create_array(&wkb_values, &self.arg_types[0]))
+    }
+
+    /// Invoke this function with a geometry array and a scalar
+    pub fn invoke_wkb_array_scalar(
+        &self,
+        wkb_values: Vec<Option<&str>>,
+        arg: impl Literal,
+    ) -> Result<ArrayRef> {
+        let wkb_array = create_array(&wkb_values, &self.arg_types[0]);
+        self.invoke_arrays_scalar(vec![wkb_array], arg)
+    }
+
+    /// Invoke this function with an array
+    pub fn invoke_array(&self, array: ArrayRef) -> Result<ArrayRef> {
+        self.invoke_arrays(vec![array])
+    }
+
+    /// Invoke a binary function with an array and a scalar
+    pub fn invoke_array_scalar(&self, array: ArrayRef, arg: impl Literal) -> Result<ArrayRef> {
+        self.invoke_arrays_scalar(vec![array], arg)
+    }
+
+    /// Invoke a binary function with an array, and two scalars
+    pub fn invoke_array_scalar_scalar(
+        &self,
+        array: ArrayRef,
+        arg0: impl Literal,
+        arg1: impl Literal,
+    ) -> Result<ArrayRef> {
+        self.invoke_arrays_scalar_scalar(vec![array], arg0, arg1)
+    }
+
+    /// Invoke a binary function with a scalar and an array
+    pub fn invoke_scalar_array(&self, arg: impl Literal, array: ArrayRef) -> Result<ArrayRef> {
+        self.invoke_scalar_arrays(arg, vec![array])
+    }
+
+    /// Invoke a binary function with two arrays
+    pub fn invoke_array_array(&self, array0: ArrayRef, array1: ArrayRef) -> Result<ArrayRef> {
+        self.invoke_arrays(vec![array0, array1])
+    }
+
+    /// Invoke a binary function with two arrays and a scalar
+    pub fn invoke_array_array_scalar(
+        &self,
+        array0: ArrayRef,
+        array1: ArrayRef,
+        arg: impl Literal,
+    ) -> Result<ArrayRef> {
+        self.invoke_arrays_scalar(vec![array0, array1], arg)
+    }
+
+    fn invoke_scalar_arrays(&self, arg: impl Literal, arrays: Vec<ArrayRef>) -> Result<ArrayRef> {
+        let scalar_arg = Self::scalar_arg(arg, &self.arg_types[0])?;
+        let mut args = zip(arrays, &self.arg_types[1..])
+            .map(|(array, sedona_type)| {
+                ColumnarValue::Array(array).cast_to(sedona_type.storage_type(), None)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        args.insert(0, scalar_arg);
+
+        if let ColumnarValue::Array(array) = self.invoke(args)? {
+            Ok(array)
+        } else {
+            sedona_internal_err!("Expected array result from scalar/array invoke")
+        }
+    }
+
+    fn invoke_arrays_scalar(&self, arrays: Vec<ArrayRef>, arg: impl Literal) -> Result<ArrayRef> {
+        let mut args = zip(arrays, &self.arg_types)
+            .map(|(array, sedona_type)| {
+                ColumnarValue::Array(array).cast_to(sedona_type.storage_type(), None)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let index = args.len();
+        args.push(Self::scalar_arg(arg, &self.arg_types[index])?);
+
+        if let ColumnarValue::Array(array) = self.invoke(args)? {
+            Ok(array)
+        } else {
+            sedona_internal_err!("Expected array result from array/scalar invoke")
+        }
+    }
+
+    fn invoke_arrays_scalar_scalar(
+        &self,
+        arrays: Vec<ArrayRef>,
+        arg0: impl Literal,
+        arg1: impl Literal,
+    ) -> Result<ArrayRef> {
+        let mut args = zip(arrays, &self.arg_types)
+            .map(|(array, sedona_type)| {
+                ColumnarValue::Array(array).cast_to(sedona_type.storage_type(), None)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let index = args.len();
+        args.push(Self::scalar_arg(arg0, &self.arg_types[index])?);
+        args.push(Self::scalar_arg(arg1, &self.arg_types[index + 1])?);
+
+        if let ColumnarValue::Array(array) = self.invoke(args)? {
+            Ok(array)
+        } else {
+            sedona_internal_err!("Expected array result from array/scalar invoke")
+        }
+    }
+
+    // Invoke a function with a set of arrays
+    pub fn invoke_arrays(&self, arrays: Vec<ArrayRef>) -> Result<ArrayRef> {
+        let args = zip(arrays, &self.arg_types)
+            .map(|(array, sedona_type)| {
+                ColumnarValue::Array(array).cast_to(sedona_type.storage_type(), None)
+            })
+            .collect::<Result<_>>()?;
+
+        if let ColumnarValue::Array(array) = self.invoke(args)? {
+            Ok(array)
+        } else {
+            sedona_internal_err!("Expected array result from array invoke")
+        }
+    }
+
+    pub fn invoke(&self, args: Vec<ColumnarValue>) -> Result<ColumnarValue> {
+        let scalar_args = args
+            .iter()
+            .map(|arg| match arg {
+                ColumnarValue::Array(_) => None,
+                ColumnarValue::Scalar(scalar_value) => Some(scalar_value.clone()),
+            })
+            .collect::<Vec<_>>();
+
+        let return_type = self.return_type_with_scalars_inner(&scalar_args)?;
+        self.invoke_with_return_type(args, Some(return_type))
+    }
+
+    pub fn invoke_with_return_type(
+        &self,
+        args: Vec<ColumnarValue>,
+        return_type: Option<SedonaType>,
+    ) -> Result<ColumnarValue> {
+        assert_eq!(args.len(), self.arg_types.len(), "Unexpected arg length");
+
+        let mut number_rows = 1;
+        for arg in &args {
+            match arg {
+                ColumnarValue::Array(array) => {
+                    number_rows = array.len();
+                    break;
+                }
+                _ => continue,
+            }
+        }
+
+        let return_type = match return_type {
+            Some(return_type) => return_type,
+            None => self.return_type()?,
+        };
+
+        let args = ScalarFunctionArgs {
+            args,
+            arg_fields: self.arg_fields(),
+            number_rows,
+            return_field: return_type.to_storage_field("", true)?.into(),
+            config_options: Arc::clone(&self.config_options),
+        };
+
+        self.udf.invoke_with_args(args)
+    }
+
+    fn scalar_arg(arg: impl Literal, sedona_type: &SedonaType) -> Result<ColumnarValue> {
+        Ok(ColumnarValue::Scalar(Self::scalar_lit(arg, sedona_type)?))
+    }
+
+    fn scalar_lit(arg: impl Literal, sedona_type: &SedonaType) -> Result<ScalarValue> {
+        if let Expr::Literal(scalar, _) = arg.lit() {
+            let is_geometry_or_geography = match sedona_type {
+                SedonaType::Wkb(_, _) | SedonaType::WkbView(_, _) => true,
+                SedonaType::Arrow(_) if sedona_type.is_item_crs() => true,
+                _ => false,
+            };
+
+            if matches!(sedona_type, SedonaType::Raster) {
+                // A raster literal is a one-row struct ScalarValue (e.g. from
+                // RasterSpec::scalar()); anything else (other than null) is a
+                // caller mistake that would otherwise die deep in arrow-cast.
+                if &scalar.data_type() == sedona_type.storage_type() {
+                    Ok(scalar)
+                } else if scalar.is_null() {
+                    scalar.cast_to(sedona_type.storage_type())
+                } else {
+                    sedona_internal_err!("Can't interpret scalar {scalar} as type {sedona_type}")
+                }
+            } else if is_geometry_or_geography {
+                if let ScalarValue::Utf8(expected_wkt) = scalar {
+                    Ok(create_scalar(expected_wkt.as_deref(), sedona_type))
+                } else if &scalar.data_type() == sedona_type.storage_type() {
+                    Ok(scalar)
+                } else if scalar.is_null() {
+                    Ok(create_scalar(None, sedona_type))
+                } else {
+                    sedona_internal_err!("Can't interpret scalar {scalar} as type {sedona_type}")
+                }
+            } else {
+                scalar.cast_to(sedona_type.storage_type())
+            }
+        } else {
+            sedona_internal_err!("Can't use test scalar invoke where .lit() returns non-literal")
+        }
+    }
+
+    fn arg_fields(&self) -> Vec<FieldRef> {
+        self.arg_types
+            .iter()
+            .map(|data_type| data_type.to_storage_field("", false).map(Arc::new))
+            .collect::<Result<Vec<_>>>()
+            .unwrap()
+    }
+}

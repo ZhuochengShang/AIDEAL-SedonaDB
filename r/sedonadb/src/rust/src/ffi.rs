@@ -1,0 +1,121 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::sync::Arc;
+
+use arrow_array::{
+    ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema},
+    ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream},
+    make_array, ArrayRef,
+};
+use arrow_schema::{Field, Schema};
+use datafusion::catalog::TableProvider;
+use datafusion_expr::{ScalarUDF, ScalarUDFImpl};
+use datafusion_ffi::udf::FFI_ScalarUDF;
+use savvy::{savvy_err, IntoExtPtrSexp};
+use sedona_extension::extension::SedonaCTableProvider;
+use sedona_extension::table_provider::ImportedTableProvider;
+
+pub fn import_schema(mut xptr: savvy::Sexp) -> savvy::Result<Schema> {
+    let ffi_schema: &FFI_ArrowSchema = import_xptr(&mut xptr, "nanoarrow_schema")?;
+    let schema = Schema::try_from(ffi_schema)?;
+    Ok(schema)
+}
+
+pub fn import_field(mut xptr: savvy::Sexp) -> savvy::Result<Field> {
+    let ffi_schema: &FFI_ArrowSchema = import_xptr(&mut xptr, "nanoarrow_schema")?;
+    let schema = Field::try_from(ffi_schema)?;
+    Ok(schema)
+}
+
+pub fn import_array(
+    mut xptr: savvy::Sexp,
+    schema_xptr: savvy::Sexp,
+) -> savvy::Result<(Field, ArrayRef)> {
+    let field = import_field(schema_xptr)?;
+    let ffi_array_ref: &mut FFI_ArrowArray = import_xptr(&mut xptr, "nanoarrow_array")?;
+    let ffi_array_owned = unsafe { FFI_ArrowArray::from_raw(ffi_array_ref as _) };
+    let array_data =
+        unsafe { from_ffi_and_data_type(ffi_array_owned as _, field.data_type().clone())? };
+    let array_ref = make_array(array_data);
+    Ok((field, array_ref))
+}
+
+pub fn import_array_stream(mut xptr: savvy::Sexp) -> savvy::Result<ArrowArrayStreamReader> {
+    let ffi_stream: &mut FFI_ArrowArrayStream = import_xptr(&mut xptr, "nanoarrow_array_stream")?;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(ffi_stream as _)? };
+    Ok(reader)
+}
+
+pub fn import_table_provider(
+    mut provider_xptr: savvy::Sexp,
+) -> savvy::Result<Arc<dyn TableProvider>> {
+    let ffi_provider: &mut SedonaCTableProvider =
+        import_xptr(&mut provider_xptr, "sedonadb_table_provider")?;
+    // Move the SedonaCTableProvider out of the external pointer.
+    // Clear the structure after reading to prevent double-free when R garbage collects.
+    let ffi_provider = unsafe {
+        let provider = std::ptr::read(ffi_provider);
+        // Clear the entire structure to prevent any accidental use
+        std::ptr::write_bytes(ffi_provider as *mut SedonaCTableProvider, 0, 1);
+        provider
+    };
+    // try_new validates the release callback
+    let provider = ImportedTableProvider::try_new(ffi_provider)?;
+    Ok(Arc::new(provider))
+}
+
+pub fn import_scalar_udf(mut scalar_udf_xptr: savvy::Sexp) -> savvy::Result<ScalarUDF> {
+    let ffi_scalar_udf_ref: &FFI_ScalarUDF =
+        import_xptr(&mut scalar_udf_xptr, "datafusion_scalar_udf")?;
+    let udf_impl: Arc<dyn ScalarUDFImpl> = ffi_scalar_udf_ref.into();
+    Ok(ScalarUDF::new_from_shared_impl(udf_impl))
+}
+
+fn import_xptr<'a, T>(xptr: &'a mut savvy::Sexp, cls: &str) -> savvy::Result<&'a mut T> {
+    if !xptr.is_external_pointer() {
+        return Err(savvy_err!(
+            "Expected external pointer with class {cls} but got a different R object"
+        ));
+    }
+
+    if !xptr
+        .get_class()
+        .map(|classes| classes.contains(&cls))
+        .unwrap_or(false)
+    {
+        return Err(savvy_err!(
+            "Expected external pointer of class {cls} but got external pointer with classes {:?}",
+            xptr.get_class()
+        ));
+    }
+
+    let typed_ptr = unsafe { savvy_ffi::R_ExternalPtrAddr(xptr.0) as *mut T };
+    if let Some(type_ref) = unsafe { typed_ptr.as_mut() } {
+        Ok(type_ref)
+    } else {
+        Err(savvy_err!("external pointer with class {cls} is null"))
+    }
+}
+
+#[repr(C)]
+pub struct FFIScalarUdfR(pub FFI_ScalarUDF);
+impl IntoExtPtrSexp for FFIScalarUdfR {}
+
+#[repr(C)]
+pub struct SedonaCTableProviderR(pub SedonaCTableProvider);
+impl IntoExtPtrSexp for SedonaCTableProviderR {}

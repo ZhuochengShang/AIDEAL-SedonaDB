@@ -1,0 +1,716 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+use std::fmt::Display;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use datafusion_common::config::{
+    ConfigEntry, ConfigExtension, ConfigField, ConfigOptions, ExtensionOptions, Visit,
+};
+use datafusion_common::Result;
+use datafusion_common::{config_err, config_namespace};
+use regex::Regex;
+use sedona_geometry::bounding_box::BoundingBox;
+use sedona_geometry::bounds::{WkbBounder2D, WkbBounder2DFactory};
+use sedona_geometry::error::SedonaGeometryError;
+use sedona_geometry::transform::{CrsEngine, CrsTransform};
+use sedona_geometry::types::Edges;
+
+/// Default minimum number of analyzed geometries for speculative execution mode to select an
+/// optimal execution mode.
+pub const DEFAULT_SPECULATIVE_THRESHOLD: usize = 1000;
+
+/// Default minimum number of points per geometry to use prepared geometries for the build side.
+pub const DEFAULT_MIN_POINTS_FOR_BUILD_PREPARATION: usize = 50;
+
+config_namespace! {
+    /// Configuration options for Sedona.
+    pub struct SedonaOptions {
+        /// Options for spatial join
+        pub spatial_join: SpatialJoinOptions, default = SpatialJoinOptions::default()
+
+        /// Global [SedonaRuntime] for CRS and geography operations
+        pub runtime: SedonaRuntime, default = SedonaRuntime::default()
+
+        /// Options for configuring GDAL usage
+        pub gdal: GdalOptions, default = GdalOptions::default()
+    }
+}
+
+config_namespace! {
+    /// Configuration options for GDAL usage.
+    pub struct GdalOptions {
+        /// CPL_DEBUG controls whether GDAL outputs debug information to stderr.
+        /// This can be helpful for diagnosing issues with GDAL dataset handling,
+        /// but may produce verbose output. Set to true to enable CPL_DEBUG output from GDAL.
+        pub cpl_debug: bool, default = false
+
+        /// Memory limit, in megabytes, for GDAL warp operations (used by
+        /// RS_ReprojectMatch). GDAL caches working data up to this size while
+        /// warping; a larger limit can reduce the number of passes over a large
+        /// raster at the cost of memory. Megabytes match `gdalwarp -wm`. Leave
+        /// unset to use GDAL's own default.
+        pub warp_memory_limit_mb: Option<usize>, default = None
+    }
+}
+
+config_namespace! {
+    /// Configuration options for spatial join.
+    ///
+    /// This struct controls various aspects of how spatial joins are performed,
+    /// including prepared geometry usage and spatial library used for evaluating
+    /// spatial predicates.
+    pub struct SpatialJoinOptions {
+        /// Enable optimized spatial join
+        pub enable: bool, default = true
+
+        /// Spatial library to use for spatial join
+        pub spatial_library: SpatialLibrary, default = SpatialLibrary::Tg
+
+        /// Options for configuring the GEOS spatial library
+        pub geos: GeosOptions, default = GeosOptions::default()
+
+        /// Options for configuring the TG spatial library
+        pub tg: TgOptions, default = TgOptions::default()
+
+        /// The execution mode determining how prepared geometries are used
+        pub execution_mode: ExecutionMode, default = ExecutionMode::Speculative(DEFAULT_SPECULATIVE_THRESHOLD)
+
+        /// Collect build side partitions concurrently (using spawned tasks).
+        /// Set to false for contexts where spawning new tasks is not supported.
+        pub concurrent_build_side_collection: bool, default = true
+
+        /// Include tie-breakers in KNN join results when there are tied distances
+        pub knn_include_tie_breakers: bool, default = false
+
+        /// Repartition the probe side before performing spatial join. This can improve performance by
+        /// balancing the workload, especially for skewed datasets or large sorted datasets where spatial
+        /// locality might cause imbalanced partitions when running out-of-core spatial join.
+        pub repartition_probe_side: bool, default = true
+
+        /// Reorder spatial join inputs to put the smaller input on the build side
+        /// when statistics are available. If set to `false`, spatial joins
+        /// preserve the original query order.
+        pub spatial_join_reordering: bool, default = true
+
+        /// Maximum number of sample bounding boxes collected from the index side for partitioning the
+        /// data when running out-of-core spatial join
+        pub max_index_side_bbox_samples: usize, default = 10000
+
+        /// Minimum number of sample bounding boxes collected from the index side for partitioning the
+        /// data when running out-of-core spatial join
+        pub min_index_side_bbox_samples: usize, default = 1000
+
+        /// Target sampling rate for sampling bounding boxes from the index side for partitioning the
+        /// data when running out-of-core spatial join
+        pub target_index_side_bbox_sampling_rate: f64, default = 0.01
+
+        /// The in memory size threshold of batches written to spill files. If the spilled batch is
+        /// too large, it will be broken into several smaller parts before written to spill files.
+        /// This is for avoiding overshooting the memory limit when reading spilled batches from
+        /// spill files. Specify 0 for unlimited size.
+        pub spilled_batch_in_memory_size_threshold: usize, default = 0
+
+        /// The minimum number of geometry pairs per chunk required to enable parallel
+        /// refinement during the spatial join operation. When the refinement phase has
+        /// fewer geometry pairs than this threshold, it will run sequentially instead
+        /// of spawning parallel tasks. Higher values reduce parallelization overhead
+        /// for small datasets, while lower values enable more fine-grained parallelism.
+        pub parallel_refinement_chunk_size: usize, default = 8192
+
+        /// Options for debugging or testing spatial join
+        pub debug : SpatialJoinDebugOptions, default = SpatialJoinDebugOptions::default()
+    }
+}
+
+config_namespace! {
+    /// Configurations for debugging or testing spatial join
+    pub struct SpatialJoinDebugOptions {
+        /// Number of spatial partitions to use for spatial join
+        pub num_spatial_partitions: NumSpatialPartitionsConfig, default = NumSpatialPartitionsConfig::Auto
+
+        /// The amount of memory for intermittent usage such as spatially repartitioning the data
+        pub memory_for_intermittent_usage: Option<usize>, default = None
+
+        /// Force spilling while collecting the build side or not
+        pub force_spill: bool, default = false
+
+        /// Seed for random processes in the spatial join for testing purpose
+        pub random_seed: Option<u64>, default = None
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum NumSpatialPartitionsConfig {
+    /// Automatically determine the number of spatial partitions
+    Auto,
+
+    /// Use a fixed number of spatial partitions
+    Fixed(usize),
+}
+
+impl ConfigField for NumSpatialPartitionsConfig {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        let value = match self {
+            NumSpatialPartitionsConfig::Auto => "auto".into(),
+            NumSpatialPartitionsConfig::Fixed(n) => format!("{n}"),
+        };
+        v.some(key, value, description);
+    }
+
+    fn set(&mut self, _key: &str, value: &str) -> Result<()> {
+        let value = value.to_lowercase();
+        let config = match value.as_str() {
+            "auto" => NumSpatialPartitionsConfig::Auto,
+            _ => match value.parse::<usize>() {
+                Ok(n) => {
+                    if n > 0 {
+                        NumSpatialPartitionsConfig::Fixed(n)
+                    } else {
+                        return Err(datafusion_common::DataFusionError::Configuration(
+                            "num_spatial_partitions must be greater than 0".to_string(),
+                        ));
+                    }
+                }
+                Err(_) => {
+                    return Err(datafusion_common::DataFusionError::Configuration(format!(
+                        "Unknown num_spatial_partitions config: {value}. Expected formats: auto, <number>"
+                    )));
+                }
+            },
+        };
+        *self = config;
+        Ok(())
+    }
+}
+
+config_namespace! {
+    /// Configuration options for the GEOS spatial library
+    pub struct GeosOptions {
+        /// The minimum number of points per geometry to use prepared geometries for the build side.
+        pub min_points_for_build_preparation: usize, default = DEFAULT_MIN_POINTS_FOR_BUILD_PREPARATION
+    }
+}
+
+config_namespace! {
+    /// Configuration options for the TG spatial library
+    pub struct TgOptions {
+        /// The index type to use for the TG spatial library
+        pub index_type: TgIndexType, default = TgIndexType::YStripes
+    }
+}
+
+impl ConfigExtension for SedonaOptions {
+    const PREFIX: &'static str = "sedona";
+}
+
+impl ExtensionOptions for SedonaOptions {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn cloned(&self) -> Box<dyn ExtensionOptions> {
+        Box::new(self.clone())
+    }
+
+    fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        <Self as ConfigField>::set(self, key, value)
+    }
+
+    fn entries(&self) -> Vec<ConfigEntry> {
+        struct Visitor(Vec<ConfigEntry>);
+
+        impl Visit for Visitor {
+            fn some<V: Display>(&mut self, key: &str, value: V, description: &'static str) {
+                self.0.push(ConfigEntry {
+                    key: key.to_string(),
+                    value: Some(value.to_string()),
+                    description,
+                })
+            }
+
+            fn none(&mut self, key: &str, description: &'static str) {
+                self.0.push(ConfigEntry {
+                    key: key.to_string(),
+                    value: None,
+                    description,
+                })
+            }
+        }
+
+        let mut v = Visitor(vec![]);
+        self.visit(&mut v, Self::PREFIX, "");
+        v.0
+    }
+}
+
+/// Execution mode for spatial join operations, controlling prepared geometry usage.
+///
+/// Prepared geometries are pre-processed spatial objects that can significantly
+/// improve performance for spatial predicate evaluation when the same geometry
+/// is used multiple times in comparisons.
+///
+/// The choice of execution mode depends on the specific characteristics of your
+/// spatial join workload, as well as the spatial relation predicate between the
+/// two tables. Some of the spatial relation computations cannot be accelerated by
+/// prepared geometries at all (for example, ST_Touches, ST_Crosses, ST_DWithin).
+#[derive(Debug, Clone, PartialEq, Copy)]
+pub enum ExecutionMode {
+    /// Don't use prepared geometries for spatial predicate evaluation.
+    PrepareNone,
+
+    /// Create prepared geometries for the build side (left/smaller table).
+    PrepareBuild,
+
+    /// Create prepared geometries for the probe side (right/larger table).
+    PrepareProbe,
+
+    /// Automatically choose the best execution mode based on the characteristics of
+    /// first few geometries on the probe side.
+    Speculative(usize),
+}
+
+impl ExecutionMode {
+    /// Convert the execution mode to a usize value.
+    ///
+    /// This is used to show the execution mode in the metrics. We use a gauge value
+    /// to represent the execution mode.
+    pub fn to_usize(&self) -> usize {
+        match self {
+            ExecutionMode::PrepareNone => 0,
+            ExecutionMode::PrepareBuild => 1,
+            ExecutionMode::PrepareProbe => 2,
+            ExecutionMode::Speculative(_) => 3,
+        }
+    }
+}
+
+impl ConfigField for ExecutionMode {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        let value = match self {
+            ExecutionMode::PrepareNone => "prepare_none".into(),
+            ExecutionMode::PrepareBuild => "prepare_build".into(),
+            ExecutionMode::PrepareProbe => "prepare_probe".into(),
+            ExecutionMode::Speculative(n) => format!("auto[{n}]"),
+        };
+        v.some(key, value, description);
+    }
+
+    fn set(&mut self, _key: &str, value: &str) -> Result<()> {
+        let value = value.to_lowercase();
+        let mode = match value.as_str() {
+            "prepare_none" => ExecutionMode::PrepareNone,
+            "prepare_build" => ExecutionMode::PrepareBuild,
+            "prepare_probe" => ExecutionMode::PrepareProbe,
+            _ => {
+                // Match "auto" or "auto[number]" pattern
+                let auto_regex = Regex::new(r"^auto(?:\[(\d+)\])?$").unwrap();
+
+                if let Some(captures) = auto_regex.captures(&value) {
+                    // If there's a captured group (the number), use it; otherwise default to 100
+                    let n = if let Some(number_match) = captures.get(1) {
+                        match number_match.as_str().parse::<usize>() {
+                            Ok(n) => {
+                                if n == 0 {
+                                    return Err(datafusion_common::DataFusionError::Configuration(
+                                        "Invalid number in auto mode: 0 is not allowed".to_string(),
+                                    ));
+                                }
+                                n
+                            }
+                            Err(_) => {
+                                return Err(datafusion_common::DataFusionError::Configuration(
+                                    format!(
+                                        "Invalid number in auto mode: {}",
+                                        number_match.as_str()
+                                    ),
+                                ));
+                            }
+                        }
+                    } else {
+                        DEFAULT_SPECULATIVE_THRESHOLD // Default for plain "auto"
+                    };
+                    ExecutionMode::Speculative(n)
+                } else {
+                    return Err(datafusion_common::DataFusionError::Configuration(
+                        format!("Unknown execution mode: {value}. Expected formats: prepare_none, prepare_build, prepare_probe, auto, auto[number]")
+                    ));
+                }
+            }
+        };
+        *self = mode;
+        Ok(())
+    }
+}
+
+/// The spatial library to use for evaluating spatial predicates
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum SpatialLibrary {
+    /// Use georust/geo library (<https://github.com/georust/geo>)
+    Geo,
+
+    /// Use GEOS library via georust/geos (<https://github.com/georust/geos>)
+    Geos,
+
+    /// Use tiny geometry library (<https://github.com/tidwall/tg>)
+    Tg,
+}
+
+impl ConfigField for SpatialLibrary {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        let value = match self {
+            SpatialLibrary::Geo => "geo",
+            SpatialLibrary::Geos => "geos",
+            SpatialLibrary::Tg => "tg",
+        };
+        v.some(key, value, description);
+    }
+
+    fn set(&mut self, _key: &str, value: &str) -> Result<()> {
+        let value = value.to_lowercase();
+        let library = match value.as_str() {
+            "geo" => SpatialLibrary::Geo,
+            "geos" => SpatialLibrary::Geos,
+            "tg" => SpatialLibrary::Tg,
+            _ => {
+                return Err(datafusion_common::DataFusionError::Configuration(format!(
+                    "Unknown spatial library: {value}. Expected: geo, geos, tg"
+                )));
+            }
+        };
+        *self = library;
+        Ok(())
+    }
+}
+
+/// The index type to use for the TG spatial library
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum TgIndexType {
+    /// Natural index
+    Natural,
+
+    /// Y-stripes index
+    YStripes,
+}
+
+impl ConfigField for TgIndexType {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        let value = match self {
+            TgIndexType::Natural => "natural",
+            TgIndexType::YStripes => "ystripes",
+        };
+        v.some(key, value, description);
+    }
+
+    fn set(&mut self, _key: &str, value: &str) -> Result<()> {
+        let value = value.to_lowercase();
+        let index_type = match value.as_str() {
+            "natural" => TgIndexType::Natural,
+            "ystripes" => TgIndexType::YStripes,
+            _ => {
+                return Err(datafusion_common::DataFusionError::Configuration(format!(
+                    "Unknown TG index type: {value}. Expected: natural, ystripes"
+                )));
+            }
+        };
+        *self = index_type;
+        Ok(())
+    }
+}
+
+/// Access spatial utilities at runtime
+///
+/// These utilities are generally provided by third-party libraries (e.g.,
+/// PROJ, S2), abstracted here to simplify the dependencies between crates.
+#[derive(Debug, Clone)]
+pub struct SedonaRuntime {
+    crs_engine: Arc<dyn CrsEngine + Send + Sync>,
+    bounder_factory: WkbBounder2DFactory,
+}
+
+impl SedonaRuntime {
+    /// Replace the runtime [CrsEngine] reference
+    pub fn with_crs_engine(&self, crs_engine: Arc<dyn CrsEngine + Send + Sync>) -> Self {
+        Self {
+            crs_engine,
+            ..self.clone()
+        }
+    }
+
+    /// Replace the runtime [WkbBounder2D] reference for a specific [Edges]
+    ///
+    /// Errors for edges that are not currently supported by SedonaDB.
+    pub fn with_bounder(&self, edges: Edges, bounder: Arc<dyn WkbBounder2D>) -> Result<Self> {
+        Ok(Self {
+            bounder_factory: self.bounder_factory.with_bounder(edges, bounder),
+            ..self.clone()
+        })
+    }
+
+    /// Access a global [CrsEngine] for coordinate transformations and CRS metadata operations
+    pub fn crs_engine(&self) -> &Arc<dyn CrsEngine + Send + Sync> {
+        &self.crs_engine
+    }
+
+    /// Get a registered bounder for a given edge type
+    pub fn bounder_factory(&self) -> &WkbBounder2DFactory {
+        &self.bounder_factory
+    }
+}
+
+impl Default for SedonaRuntime {
+    fn default() -> Self {
+        Self {
+            crs_engine: Arc::new(DefaultCrsEngine {}),
+            bounder_factory: WkbBounder2DFactory::default(),
+        }
+    }
+}
+
+impl PartialEq for SedonaRuntime {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.crs_engine, &other.crs_engine)
+            && self.bounder_factory == other.bounder_factory
+    }
+}
+
+impl std::fmt::Display for SedonaRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SedonaRuntime {{ bounder_factory: {} }}",
+            self.bounder_factory
+        )
+    }
+}
+
+impl ConfigField for SedonaRuntime {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        v.some(key, self.to_string(), description);
+    }
+
+    fn set(&mut self, key: &str, _value: &str) -> Result<()> {
+        config_err!("Can't set {key} from SQL")
+    }
+}
+
+#[derive(Debug)]
+struct DefaultCrsEngine {}
+
+impl CrsEngine for DefaultCrsEngine {
+    fn to_projjson(&self, crs_string: &str) -> Result<String, SedonaGeometryError> {
+        Err(SedonaGeometryError::Invalid(format!(
+            "Can't convert {crs_string} to PROJJSON CRS (no CrsEngine registered)"
+        )))
+    }
+
+    fn get_transform_crs_to_crs(
+        &self,
+        from: &str,
+        to: &str,
+        _area_of_interest: Option<BoundingBox>,
+        _options: &str,
+    ) -> Result<Rc<dyn CrsTransform>, SedonaGeometryError> {
+        Err(SedonaGeometryError::Invalid(format!(
+            "Can't convert coordinates from {from} to {to} (no CrsEngine registered)"
+        )))
+    }
+
+    fn get_transform_pipeline(
+        &self,
+        pipeline: &str,
+        _options: &str,
+    ) -> Result<Rc<dyn CrsTransform>, SedonaGeometryError> {
+        Err(SedonaGeometryError::Invalid(format!(
+            "Can't convert pipeline {pipeline} (no CrsEngine registered)"
+        )))
+    }
+}
+
+/// Run `f` with the session's CRS engine.
+///
+/// When `config_options` carries a [`SedonaOptions`] extension (the query
+/// path), the engine configured in its runtime is used. Otherwise (e.g. a
+/// direct `invoke_batch` call, or a context without a configured runtime) this
+/// falls back to [`DefaultCrsEngine`], which errors when no engine has been
+/// registered.
+///
+/// Keeping this `SedonaOptions` -> runtime engine extraction in `sedona-common`
+/// lets geometry and raster CRS functions honor an injected engine without
+/// depending on a concrete engine implementation such as `sedona-proj`.
+pub fn with_crs_engine<T>(
+    config_options: Option<&ConfigOptions>,
+    f: impl FnOnce(&dyn CrsEngine) -> Result<T>,
+) -> Result<T> {
+    if let Some(options) = config_options.and_then(|o| o.extensions.get::<SedonaOptions>()) {
+        f(options.runtime.crs_engine().as_ref())
+    } else {
+        f(&DefaultCrsEngine {})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion_common::config::ConfigField;
+
+    #[test]
+    fn test_execution_mode_parsing_basic_modes() {
+        let mut mode = ExecutionMode::PrepareNone;
+
+        // Test basic modes
+        assert!(mode.set("", "prepare_none").is_ok());
+        assert_eq!(mode, ExecutionMode::PrepareNone);
+
+        assert!(mode.set("", "prepare_build").is_ok());
+        assert_eq!(mode, ExecutionMode::PrepareBuild);
+
+        assert!(mode.set("", "prepare_probe").is_ok());
+        assert_eq!(mode, ExecutionMode::PrepareProbe);
+    }
+
+    #[test]
+    fn test_execution_mode_parsing_auto_modes() {
+        let mut mode = ExecutionMode::PrepareNone;
+
+        // Test auto mode with default value
+        assert!(mode.set("", "auto").is_ok());
+        assert_eq!(mode, ExecutionMode::Speculative(1000));
+
+        // Test auto mode with specific values
+        assert!(mode.set("", "auto[10]").is_ok());
+        assert_eq!(mode, ExecutionMode::Speculative(10));
+
+        assert!(mode.set("", "auto[500]").is_ok());
+        assert_eq!(mode, ExecutionMode::Speculative(500));
+
+        assert!(mode.set("", "auto[1]").is_ok());
+        assert_eq!(mode, ExecutionMode::Speculative(1));
+    }
+
+    #[test]
+    fn test_execution_mode_parsing_case_insensitive() {
+        let mut mode = ExecutionMode::PrepareNone;
+
+        // Test case insensitivity
+        assert!(mode.set("", "PREPARE_NONE").is_ok());
+        assert_eq!(mode, ExecutionMode::PrepareNone);
+
+        assert!(mode.set("", "PREPARE_BUILD").is_ok());
+        assert_eq!(mode, ExecutionMode::PrepareBuild);
+
+        assert!(mode.set("", "PREPARE_PROBE").is_ok());
+        assert_eq!(mode, ExecutionMode::PrepareProbe);
+
+        assert!(mode.set("", "AUTO").is_ok());
+        assert_eq!(mode, ExecutionMode::Speculative(1000));
+
+        assert!(mode.set("", "Auto[50]").is_ok());
+        assert_eq!(mode, ExecutionMode::Speculative(50));
+    }
+
+    #[test]
+    fn test_execution_mode_parsing_invalid_formats() {
+        let mut mode = ExecutionMode::PrepareNone;
+
+        // Test invalid modes
+        assert!(mode.set("", "invalid").is_err());
+        assert!(mode.set("", "").is_err());
+        assert!(mode.set("", "auto[0]").is_err());
+        assert!(mode.set("", "auto[]").is_err());
+        assert!(mode.set("", "auto[abc]").is_err());
+        assert!(mode.set("", "auto[10").is_err());
+        assert!(mode.set("", "auto10]").is_err());
+        assert!(mode.set("", "auto[10][20]").is_err());
+        assert!(mode.set("", "auto 10").is_err());
+        assert!(mode.set("", "auto:10").is_err());
+        assert!(mode.set("", "auto(10)").is_err());
+    }
+
+    #[test]
+    fn test_tg_index_type_parsing() {
+        let mut index_type = TgIndexType::YStripes;
+
+        assert!(index_type.set("", "natural").is_ok());
+        assert_eq!(index_type, TgIndexType::Natural);
+
+        assert!(index_type.set("", "Natural").is_ok());
+        assert_eq!(index_type, TgIndexType::Natural);
+
+        assert!(index_type.set("", "ystripes").is_ok());
+        assert_eq!(index_type, TgIndexType::YStripes);
+
+        assert!(index_type.set("", "YStripes").is_ok());
+        assert_eq!(index_type, TgIndexType::YStripes);
+    }
+
+    #[test]
+    fn test_tg_index_type_parsing_invalid_formats() {
+        let mut index_type = TgIndexType::YStripes;
+
+        assert!(index_type.set("", "unindexed").is_err());
+        assert!(index_type.set("", "invalid").is_err());
+        assert!(index_type.set("", "").is_err());
+    }
+
+    #[test]
+    fn test_num_spatial_partitions_config_parsing() {
+        let mut config = NumSpatialPartitionsConfig::Auto;
+
+        assert!(config.set("", "auto").is_ok());
+        assert_eq!(config, NumSpatialPartitionsConfig::Auto);
+
+        assert!(config.set("", "10").is_ok());
+        assert_eq!(config, NumSpatialPartitionsConfig::Fixed(10));
+
+        assert!(config.set("", "0").is_err());
+        assert!(config.set("", "invalid").is_err());
+        assert!(config.set("", "fixed[10]").is_err());
+    }
+
+    #[test]
+    fn test_default_crs_engine_returns_error() {
+        let provider = SedonaRuntime::default();
+        let result = provider.crs_engine().to_projjson("EPSG:4326");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Can't convert EPSG:4326 to PROJJSON CRS"),
+            "Unexpected error message: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("no CrsEngine registered"),
+            "Unexpected error message: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_runtime_option_set_from_sql_returns_error() {
+        let mut option = SedonaRuntime::default();
+        let result = option.set("sedona.runtime", "some_value");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Can't set sedona.runtime from SQL"),
+            "Unexpected error message: {err_msg}"
+        );
+    }
+}

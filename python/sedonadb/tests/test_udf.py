@@ -1,0 +1,310 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import pandas as pd
+import pyarrow as pa
+import pytest
+import sedonadb
+from sedonadb import udf
+
+
+def some_udf(arg0, arg1):
+    arg0, arg1 = (
+        pa.array(arg0.to_array()).to_pylist(),
+        pa.array(arg1.to_array()).to_pylist(),
+    )
+    return pa.array(
+        (f"{item0} / {item1}".encode() for item0, item1 in zip(arg0, arg1)),
+        pa.binary(),
+    )
+
+
+def test_udf_matchers(con):
+    udf_impl = udf.arrow_udf(pa.binary(), [udf.STRING, udf.NUMERIC])(some_udf)
+    assert udf_impl._name == "some_udf"
+
+    con.register(udf_impl)
+    pd.testing.assert_frame_equal(
+        con.sql("SELECT some_udf('abcd', 123) as col").to_pandas(),
+        pd.DataFrame({"col": [b"abcd / 123"]}),
+    )
+
+
+def test_udf_types(con):
+    udf_impl = udf.arrow_udf(pa.binary(), [pa.string(), pa.int64()])(some_udf)
+    assert udf_impl._name == "some_udf"
+
+    con.register(udf_impl)
+    pd.testing.assert_frame_equal(
+        con.sql("SELECT some_udf('abcd', 123) as col").to_pandas(),
+        pd.DataFrame({"col": [b"abcd / 123"]}),
+    )
+
+
+def test_udf_any_input(con):
+    udf_impl = udf.arrow_udf(pa.binary())(some_udf)
+    assert udf_impl._name == "some_udf"
+
+    con.register(udf_impl)
+    pd.testing.assert_frame_equal(
+        con.sql("SELECT some_udf('abcd', 123) as col").to_pandas(),
+        pd.DataFrame({"col": [b"abcd / 123"]}),
+    )
+
+
+def test_udf_return_type_fn(con):
+    udf_impl = udf.arrow_udf(lambda arg_types, arg_scalars: arg_types[0])(some_udf)
+    assert udf_impl._name == "some_udf"
+
+    con.register(udf_impl)
+    pd.testing.assert_frame_equal(
+        con.sql("SELECT some_udf('abcd'::BYTEA, 123) as col").to_pandas(),
+        pd.DataFrame({"col": [b"b'abcd' / 123"]}),
+    )
+
+
+def test_udf_array_input(con):
+    udf_impl = udf.arrow_udf(pa.binary(), [udf.STRING, udf.NUMERIC])(some_udf)
+    assert udf_impl._name == "some_udf"
+
+    con.register(udf_impl)
+    pd.testing.assert_frame_equal(
+        con.sql(
+            "SELECT some_udf(x, 123) as col FROM (VALUES ('a'), ('b'), ('c')) as t(x)"
+        ).to_pandas(),
+        pd.DataFrame({"col": [b"a / 123", b"b / 123", b"c / 123"]}),
+    )
+
+
+def test_udf_name():
+    udf_impl = udf.arrow_udf(pa.binary(), name="foofy")(some_udf)
+    assert udf_impl._name == "foofy"
+
+
+def test_shapely_udf(con):
+    import geoarrow.pyarrow as ga
+    import numpy as np
+    import shapely
+
+    @udf.arrow_udf(ga.wkb(), [udf.GEOMETRY, udf.NUMERIC])
+    def shapely_udf(geom, distance):
+        geom_wkb = pa.array(geom.storage.to_array())
+        distance = pa.array(distance.to_array())
+        geom = shapely.from_wkb(geom_wkb)
+        result_shapely = shapely.buffer(geom, distance)
+        return pa.array(shapely.to_wkb(result_shapely))
+
+    con.register(shapely_udf)
+
+    pd.testing.assert_frame_equal(
+        con.sql("SELECT ST_Area(shapely_udf(ST_Point(0, 0), 2.0)) as col").to_pandas(),
+        pd.DataFrame({"col": [12.485780609032208]}),
+    )
+
+    # Ensure we can propagate a crs
+    pd.testing.assert_frame_equal(
+        con.sql(
+            "SELECT ST_SRID(shapely_udf(ST_Point(0, 0, 3857), 2.0)) as col"
+        ).to_pandas(),
+        pd.DataFrame({"col": [3857]}, dtype=np.uint32),
+    )
+
+    # Ensure we can collect with >1 batch without hanging
+    con.funcs.table.sd_random_geometry("Point", 20000).to_view("pts", overwrite=True)
+    df = con.sql(
+        "SELECT ST_Area(shapely_udf(ST_Point(0, 0), 2.0)) as col FROM pts"
+    ).to_pandas()
+    assert len(df) == 20000
+
+    # Ensure we can execute with >1 batch without hanging
+    count = con.sql(
+        "SELECT ST_Area(shapely_udf(ST_Point(0, 0), 2.0)) as col FROM pts"
+    ).execute()
+    assert count == 20000
+
+
+def test_py_sedona_value(con):
+    @udf.arrow_udf(pa.int64())
+    def fn_arg_only(arg):
+        assert repr(arg) == "PySedonaValue Scalar Int64[1]"
+        assert arg.is_scalar() is True
+        assert repr(arg.type) == "SedonaType int64<Int64>"
+
+        return pa.array(range(len(pa.array(arg))))
+
+    con.register(fn_arg_only)
+    con.sql("SELECT fn_arg_only(123)").to_arrow_table()
+
+
+def test_udf_kwargs(con):
+    @udf.arrow_udf(pa.int64())
+    def fn_return_type(arg, *, return_type=None):
+        assert repr(return_type) == "SedonaType int64<Int64>"
+        return pa.array(range(len(pa.array(arg))))
+
+    con.register(fn_return_type)
+    con.sql("SELECT fn_return_type('123')").to_arrow_table()
+
+    @udf.arrow_udf(pa.int64())
+    def fn_num_rows(arg, *, num_rows=None):
+        assert num_rows == 1
+        return pa.array(range(len(pa.array(arg))))
+
+    con.register(fn_num_rows)
+    con.sql("SELECT fn_num_rows('123')").to_arrow_table()
+
+    @udf.arrow_udf(pa.int64())
+    def fn_num_rows_and_return_type(arg, *, num_rows=None, return_type=None):
+        assert repr(return_type) == "SedonaType int64<Int64>"
+        assert num_rows == 1
+        return pa.array(range(len(pa.array(arg))))
+
+    con.register(fn_num_rows_and_return_type)
+    con.sql("SELECT fn_num_rows_and_return_type('123')").to_arrow_table()
+
+
+def test_udf_bad_return_object(con):
+    @udf.arrow_udf(pa.binary())
+    def questionable_udf(arg):
+        return None
+
+    con.register(questionable_udf)
+    with pytest.raises(
+        sedonadb._lib.SedonaError,
+        match="Expected result of user-defined function to return an object implementing __arrow_c_array__",
+    ):
+        con.sql("SELECT questionable_udf(123) as col").to_pandas()
+
+
+def test_udf_bad_return_type(con):
+    @udf.arrow_udf(pa.binary())
+    def questionable_udf(arg):
+        return pa.array(["abc"], pa.string())
+
+    con.register(questionable_udf)
+    with pytest.raises(
+        sedonadb._lib.SedonaError,
+        match=(
+            "Expected result of user-defined function to "
+            "return array of type Binary or its storage "
+            "but got Utf8"
+        ),
+    ):
+        con.sql("SELECT questionable_udf(123) as col").to_pandas()
+
+
+def test_udf_bad_return_length(con):
+    @udf.arrow_udf(pa.binary())
+    def questionable_udf(arg):
+        return pa.array([b"abc", b"def"], pa.binary())
+
+    con.register(questionable_udf)
+    with pytest.raises(
+        sedonadb._lib.SedonaError,
+        match="Expected result of user-defined function to return array of length 1 but got 2",
+    ):
+        con.sql("SELECT questionable_udf(123) as col").to_pandas()
+
+
+def test_native_scalar_udf_export_import_roundtrip(con):
+    # A SedonaDB built-in scalar function exposes its native overload kernels
+    # via __sedonadb_scalar_udf__ (the export side of the plugin protocol).
+    # Exporting those capsules and rebuilding a UDF under a new name must
+    # produce a function whose output is identical to the built-in's, proving
+    # the native kernels survive a full export -> capsule -> import roundtrip.
+    from sedonadb.udf import sedona_native_scalar_udf
+
+    st_asbinary = con.funcs.st_asbinary
+    assert hasattr(st_asbinary, "__sedonadb_scalar_udf__")
+
+    capsules = st_asbinary.__sedonadb_scalar_udf__()
+    assert len(capsules) >= 1
+
+    # Rebuild under a fresh name so it doesn't collide with the built-in, then
+    # register it back into the same context.
+    rebuilt = sedona_native_scalar_udf(capsules, name="rt_asbinary_roundtrip")
+    con.register(rebuilt)
+
+    # Run both the built-in and the reimported UDF over a real one-row table
+    # column (not a literal) so the full execution path runs.
+    con.sql("SELECT ST_Point(30.0, 10.0) AS geom").to_view(
+        "rt_native_roundtrip", overwrite=True
+    )
+    expected = con.sql(
+        "SELECT ST_AsBinary(geom) AS col FROM rt_native_roundtrip"
+    ).to_arrow_table()
+    actual = con.sql(
+        "SELECT rt_asbinary_roundtrip(geom) AS col FROM rt_native_roundtrip"
+    ).to_arrow_table()
+
+    assert actual.equals(expected)
+
+
+def test_native_scalar_udf_export_preserves_sedona_options(con):
+    from sedonadb.udf import sedona_native_scalar_udf
+
+    capsules = con.funcs.st_envelope.__sedonadb_scalar_udf__()
+    con.register(sedona_native_scalar_udf(capsules, name="rt_envelope"))
+
+    expected = con.sql(
+        "SELECT ST_Envelope(ST_GeogFromText('POINT (1 2)')) AS col"
+    ).to_arrow_table()
+    actual = con.sql(
+        "SELECT rt_envelope(ST_GeogFromText('POINT (1 2)')) AS col"
+    ).to_arrow_table()
+
+    assert actual.equals(expected)
+
+
+def test_native_scalar_udf_register_appends_overload(con):
+    # Registering a native scalar UDF under a name already in use appends its
+    # kernels as overloads rather than replacing the function: both the
+    # previously registered signature and the newly registered one stay
+    # dispatchable. Two built-ins with disjoint input types are exported and
+    # re-registered under one shared name -- ST_AsBinary takes a geometry,
+    # ST_GeomFromWKT takes a WKT string. If registration replaced rather than
+    # appended, the geometry overload registered first would vanish and calling
+    # it would raise "No kernel matching arguments".
+    from sedonadb.udf import sedona_native_scalar_udf
+
+    name = "rt_overload_probe"
+
+    con.register(
+        sedona_native_scalar_udf(
+            con.funcs.st_asbinary.__sedonadb_scalar_udf__(), name=name
+        )
+    )
+    con.register(
+        sedona_native_scalar_udf(
+            con.funcs.st_geomfromwkt.__sedonadb_scalar_udf__(), name=name
+        )
+    )
+
+    # The geometry -> binary overload registered first is still reachable...
+    assert (
+        con.sql(f"SELECT {name}(ST_Point(30.0, 10.0)) AS col")
+        .to_arrow_table()
+        .equals(
+            con.sql("SELECT ST_AsBinary(ST_Point(30.0, 10.0)) AS col").to_arrow_table()
+        )
+    )
+
+    # ...and the WKT-string -> geometry overload appended second dispatches too.
+    pd.testing.assert_frame_equal(
+        con.sql(f"SELECT ST_AsText({name}('POINT (1 2)')) AS col").to_pandas(),
+        pd.DataFrame({"col": ["POINT(1 2)"]}),
+    )

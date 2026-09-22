@@ -1,0 +1,216 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+test_that("basic expression types can be constructed", {
+  expect_snapshot(sd_expr_column("foofy"))
+  expect_snapshot(sd_expr_literal(1L))
+  expect_snapshot(sd_expr_scalar_function("abs", list(1L)))
+  expect_snapshot(sd_expr_cast(1L, nanoarrow::na_int64()))
+  expect_snapshot(sd_expr_alias(1L, "foofy"))
+  expect_snapshot(sd_expr_binary("+", 1L, 2L))
+  expect_snapshot(sd_expr_negative(1L))
+  expect_snapshot(sd_expr_aggregate_function("sum", list(1L)))
+})
+
+test_that("columns can be inspected", {
+  col <- sd_expr_column("foofy")
+  expect_identical(col$variant_name(), "Column")
+  expect_identical(col$qualified_name(), c(NA_character_, "foofy"))
+
+  qualified_col <- sd_expr_column("foofy", qualifier = "qualified")
+  expect_identical(qualified_col$qualified_name(), c("qualified", "foofy"))
+})
+
+test_that("binary expressions can be inspected", {
+  # Check for binops
+  expr <- sd_expr_binary("==", sd_expr_column("left"), sd_expr_column("right"))
+  parsed <- sd_expr_parse_binary(expr)
+  expect_identical(parsed$op, "=")
+  expect_identical(parsed$left$qualified_name(), c(NA_character_, "left"))
+  expect_identical(parsed$right$qualified_name(), c(NA_character_, "right"))
+
+  # Check for calls
+  expr <- sd_expr_scalar_function(
+    "st_intersects",
+    list(sd_expr_column("left"), sd_expr_column("right"))
+  )
+  parsed <- sd_expr_parse_binary(expr)
+  expect_identical(parsed$op, "st_intersects")
+  expect_identical(parsed$left$qualified_name(), c(NA_character_, "left"))
+  expect_identical(parsed$right$qualified_name(), c(NA_character_, "right"))
+})
+
+test_that("casts to a type with extension metadata can't be constructed", {
+  expect_error(
+    sd_expr_cast(1L, geoarrow::geoarrow_wkb()),
+    "Can't cast to Arrow extension type 'geoarrow.wkb'"
+  )
+})
+
+test_that("literal expressions can be translated", {
+  expect_snapshot(sd_eval_expr(quote(1L)))
+})
+
+test_that("column expressions can be translated", {
+  schema <- nanoarrow::na_struct(list(col0 = nanoarrow::na_int32()))
+  expr_ctx <- sd_expr_ctx(schema)
+
+  expect_snapshot(sd_eval_expr(quote(col0), expr_ctx))
+  expect_snapshot(sd_eval_expr(quote(.data$col0), expr_ctx))
+  col_zero <- "col0"
+  expect_snapshot(sd_eval_expr(quote(.data[[col_zero]]), expr_ctx))
+
+  expect_error(
+    sd_eval_expr(quote(col1), expr_ctx),
+    "object 'col1' not found"
+  )
+})
+
+test_that("nested struct field expressions can be translated", {
+  schema <- nanoarrow::na_struct(list(
+    foo = nanoarrow::na_struct(list(
+      bar = nanoarrow::na_struct(list(baz = nanoarrow::na_int32()))
+    ))
+  ))
+  expr_ctx <- sd_expr_ctx(schema)
+
+  bar <- sd_expr_scalar_function(
+    "get_field",
+    list(sd_expr_column("foo", factory = expr_ctx$factory), "bar"),
+    factory = expr_ctx$factory
+  )
+  expected <- sd_expr_scalar_function(
+    "get_field",
+    list(bar, "baz"),
+    factory = expr_ctx$factory
+  )
+
+  actual <- sd_eval_expr(quote(foo$bar$baz), expr_ctx)
+  expect_identical(actual$debug_string(), expected$debug_string())
+
+  actual_data_pronoun <- sd_eval_expr(quote(.data$foo$bar$baz), expr_ctx)
+  expect_identical(actual_data_pronoun$debug_string(), expected$debug_string())
+
+  struct_expr <- sd_expr_scalar_function(
+    "named_struct",
+    list("value", 1L),
+    factory = expr_ctx$factory
+  )
+  expected_function_field <- sd_expr_get_field(
+    struct_expr,
+    "value",
+    factory = expr_ctx$factory
+  )
+  actual_function_field <- sd_eval_expr(
+    quote(.fns$named_struct("value", 1L)$value),
+    expr_ctx
+  )
+  expect_identical(
+    actual_function_field$debug_string(),
+    expected_function_field$debug_string()
+  )
+
+  local_object <- list(value = 1L)
+  actual_local <- sd_eval_expr(quote(local_object$value), expr_ctx)
+  expected_local <- sd_expr_literal(1L, factory = expr_ctx$factory)
+  expect_identical(actual_local$debug_string(), expected_local$debug_string())
+
+  expect_error(
+    sd_eval_expr(quote(not_a_column$bar$baz), expr_ctx),
+    "object 'not_a_column' not found"
+  )
+})
+
+test_that("function calls with a translation become function calls", {
+  # Should work for the qualified or unqualified versions
+  expect_snapshot(sd_eval_expr(quote(abs(-1L))))
+  expect_snapshot(sd_eval_expr(quote(base::abs(-1L))))
+})
+
+test_that("function calls explicitly referencing DataFusion functions work", {
+  # Scalar function
+  expect_snapshot(sd_eval_expr(quote(.fns$abs(-1L))))
+
+  # Aggregate function
+  expect_snapshot(sd_eval_expr(quote(.fns$sum(-1L))))
+  expect_snapshot(sd_eval_expr(quote(.fns$sum(-1L, na.rm = TRUE))))
+  expect_snapshot(sd_eval_expr(quote(.fns$sum(-1L, na.rm = FALSE))))
+
+  # Check for a reasonable error if this is not a valid name or we have
+  # named arguments
+  expect_snapshot_error(sd_eval_expr(quote(.fns$absolutely_not(-1L))))
+  expect_snapshot_error(sd_eval_expr(quote(.fns$absolutely_not(x = -1L))))
+})
+
+test_that("function calls referencing SedonaDB SQL functions work", {
+  expect_snapshot(sd_eval_expr(quote(st_point(0, 1))))
+  expect_snapshot(sd_eval_expr(quote(st_envelope_agg(st_point(0, 1)))))
+  expect_snapshot(
+    sd_eval_expr(quote(st_envelope_agg(st_point(0, 1), na.rm = TRUE)))
+  )
+
+  # Check for reasonable errors (named arguments are not allowed)
+  expect_snapshot_error(sd_eval_expr(quote(st_point(1, y = 2))))
+})
+
+test_that("function calls without a translation are evaluated in R", {
+  function_without_a_translation <- function(x) x + 1L
+  expect_snapshot(sd_eval_expr(quote(function_without_a_translation(1L))))
+})
+
+test_that("function calls that map to binary expressions are translated", {
+  # + and - are special-cased because in R the unary function calls are valid
+  expect_snapshot(sd_eval_expr(quote(+2)))
+  expect_snapshot(sd_eval_expr(quote(1 + 2)))
+  expect_snapshot(sd_eval_expr(quote(-2)))
+  expect_snapshot(sd_eval_expr(quote(1 - 2)))
+
+  # normal translation
+  expect_snapshot(sd_eval_expr(quote(1 > 2)))
+})
+
+test_that("basic set of numeric functions are translated", {
+  x <- sd_expr_column("x")
+  expect_snapshot(sd_eval_expr(quote(sum(x))))
+  expect_snapshot(sd_eval_expr(quote(mean(x))))
+  expect_snapshot(sd_eval_expr(quote(abs(x))))
+})
+
+test_that("nulls can be checked via is.na()", {
+  x <- sd_expr_column("x")
+  expect_snapshot(sd_eval_expr(quote(is.na(x))))
+})
+
+test_that("! is translated to NOT", {
+  x <- sd_expr_column("x")
+  expect_snapshot(sd_eval_expr(quote(!x)))
+})
+
+test_that("errors that occur during evaluation have reasonable context", {
+  function_without_a_translation <- function(x) x + 1L
+  expect_snapshot(sd_eval_expr(quote(stop("this will error"))), error = TRUE)
+})
+
+test_that("unwrap_desc() can unwrap calls to desc()", {
+  expect_identical(
+    unwrap_desc(list(quote(desc(a)), quote(dplyr::desc(b)), quote(c))),
+    list(
+      inner_exprs = list(quote(a), quote(b), quote(c)),
+      is_descending = c(TRUE, TRUE, FALSE)
+    )
+  )
+})

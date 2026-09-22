@@ -1,0 +1,243 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+use std::sync::Arc;
+
+use arrow_array::builder::BooleanBuilder;
+use arrow_schema::DataType;
+use datafusion_common::error::Result;
+use datafusion_expr::ColumnarValue;
+use sedona_expr::{
+    item_crs::ItemCrsKernel,
+    scalar_udf::{ScalarKernelRef, SedonaScalarKernel},
+};
+use sedona_schema::{datatypes::SedonaType, matchers::ArgMatcher};
+
+use crate::{executor::TgGeomExecutor, tg};
+
+/// ST_Equals() implementation using tg
+pub fn st_equals_impl() -> Vec<ScalarKernelRef> {
+    ItemCrsKernel::wrap_impl(TgPredicate::<tg::Equals>::default())
+}
+
+/// ST_Intersects() implementation using tg
+pub fn st_intersects_impl() -> Vec<ScalarKernelRef> {
+    ItemCrsKernel::wrap_impl(TgPredicate::<tg::Intersects>::default())
+}
+
+/// ST_Disjoint() implementation using tg
+pub fn st_disjoint_impl() -> Vec<ScalarKernelRef> {
+    ItemCrsKernel::wrap_impl(TgPredicate::<tg::Disjoint>::default())
+}
+
+/// ST_Contains() implementation using tg
+pub fn st_contains_impl() -> Vec<ScalarKernelRef> {
+    ItemCrsKernel::wrap_impl(TgPredicate::<tg::Contains>::default())
+}
+
+/// ST_Within() implementation using tg
+pub fn st_within_impl() -> Vec<ScalarKernelRef> {
+    ItemCrsKernel::wrap_impl(TgPredicate::<tg::Within>::default())
+}
+
+/// ST_Covers() implementation using tg
+pub fn st_covers_impl() -> Vec<ScalarKernelRef> {
+    ItemCrsKernel::wrap_impl(TgPredicate::<tg::Covers>::default())
+}
+
+/// ST_CoveredBy() implementation using tg
+pub fn st_covered_by_impl() -> Vec<ScalarKernelRef> {
+    ItemCrsKernel::wrap_impl(TgPredicate::<tg::CoveredBy>::default())
+}
+
+/// ST_Touches() implementation using tg
+pub fn st_touches_impl() -> Vec<ScalarKernelRef> {
+    ItemCrsKernel::wrap_impl(TgPredicate::<tg::Touches>::default())
+}
+
+#[derive(Debug, Default)]
+struct TgPredicate<Op> {
+    _op: Op,
+}
+
+impl<Op: tg::BinaryPredicate + Send + Sync> SedonaScalarKernel for TgPredicate<Op> {
+    fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+        let matcher = ArgMatcher::new(
+            vec![ArgMatcher::is_geometry(), ArgMatcher::is_geometry()],
+            SedonaType::Arrow(DataType::Boolean),
+        );
+
+        matcher.match_args(args)
+    }
+
+    fn invoke_batch(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+    ) -> Result<ColumnarValue> {
+        let executor = TgGeomExecutor::new(arg_types, args);
+        let mut builder = BooleanBuilder::with_capacity(executor.num_iterations());
+        executor.execute_wkb_wkb_void(|lhs, rhs| {
+            match (lhs, rhs) {
+                (Some(lhs), Some(rhs)) => {
+                    builder.append_value(Op::evaluate(lhs, rhs));
+                }
+                _ => builder.append_null(),
+            };
+            Ok(())
+        })?;
+        executor.finish(Arc::new(builder.finish()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{create_array, ArrayRef};
+    use datafusion_common::scalar::ScalarValue;
+    use rstest::rstest;
+    use sedona_expr::scalar_udf::SedonaScalarUDF;
+    use sedona_schema::datatypes::{WKB_GEOMETRY, WKB_GEOMETRY_ITEM_CRS, WKB_VIEW_GEOMETRY};
+    use sedona_testing::{
+        create::{create_array, create_scalar},
+        testers::ScalarUdfTester,
+    };
+
+    use super::*;
+
+    #[rstest]
+    fn scalar_scalar(
+        #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY, WKB_GEOMETRY_ITEM_CRS.clone())]
+        sedona_type: SedonaType,
+    ) {
+        let udf = SedonaScalarUDF::from_impl("st_intersects", st_intersects_impl());
+        let tester =
+            ScalarUdfTester::new(udf.into(), vec![sedona_type.clone(), sedona_type.clone()]);
+        tester.assert_return_type(DataType::Boolean);
+
+        let polygon_scalar = create_scalar(Some("POLYGON ((0 0, 1 0, 0 1, 0 0))"), &sedona_type);
+
+        // Check something that intersects with both argument orders
+        let result = tester
+            .invoke_scalar_scalar("POINT (0.25 0.25)", polygon_scalar.clone())
+            .unwrap();
+        tester.assert_scalar_result_equals(result, true);
+
+        let result = tester
+            .invoke_scalar_scalar(polygon_scalar.clone(), "POINT (0.25 0.25)")
+            .unwrap();
+        tester.assert_scalar_result_equals(result, true);
+
+        // Check something that doesn't intersect with both argument orders
+        let result = tester
+            .invoke_scalar_scalar("POINT (10 10)", polygon_scalar.clone())
+            .unwrap();
+        tester.assert_scalar_result_equals(result, false);
+
+        let result = tester
+            .invoke_scalar_scalar(polygon_scalar.clone(), "POINT (10 10)")
+            .unwrap();
+        tester.assert_scalar_result_equals(result, false);
+
+        // Check a null in both argument orders
+        let result = tester
+            .invoke_scalar_scalar(polygon_scalar.clone(), ScalarValue::Null)
+            .unwrap();
+        tester.assert_scalar_result_equals(result, ScalarValue::Null);
+
+        let result = tester
+            .invoke_scalar_scalar(ScalarValue::Null, polygon_scalar.clone())
+            .unwrap();
+        tester.assert_scalar_result_equals(result, ScalarValue::Null);
+
+        // ...and check a null as both arguments
+        let result = tester
+            .invoke_scalar_scalar(ScalarValue::Null, ScalarValue::Null)
+            .unwrap();
+        tester.assert_scalar_result_equals(result, ScalarValue::Null);
+    }
+
+    #[rstest]
+    fn array_scalar(
+        #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY, WKB_GEOMETRY_ITEM_CRS.clone())]
+        sedona_type: SedonaType,
+    ) {
+        let udf = SedonaScalarUDF::from_impl("st_intersects", st_intersects_impl());
+        let tester =
+            ScalarUdfTester::new(udf.into(), vec![sedona_type.clone(), sedona_type.clone()]);
+        tester.assert_return_type(DataType::Boolean);
+
+        let point_array = create_array(
+            &[Some("POINT (0.25 0.25)"), Some("POINT (10 10)"), None],
+            &sedona_type.clone(),
+        );
+        let polygon_scalar =
+            create_scalar(Some("POLYGON ((0 0, 1 0, 0 1, 0 0))"), &sedona_type.clone());
+
+        // Array, Scalar -> Array
+        let expected: ArrayRef = create_array!(Boolean, [Some(true), Some(false), None]);
+        assert_eq!(
+            &tester
+                .invoke_array_scalar(point_array.clone(), polygon_scalar.clone())
+                .unwrap(),
+            &expected
+        );
+        assert_eq!(
+            &tester
+                .invoke_scalar_array(polygon_scalar.clone(), point_array.clone())
+                .unwrap(),
+            &expected
+        );
+    }
+
+    #[rstest]
+    fn array_array(
+        #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY, WKB_GEOMETRY_ITEM_CRS.clone())]
+        sedona_type: SedonaType,
+    ) {
+        let udf = SedonaScalarUDF::from_impl("st_intersects", st_intersects_impl());
+        let tester =
+            ScalarUdfTester::new(udf.into(), vec![sedona_type.clone(), sedona_type.clone()]);
+        tester.assert_return_type(DataType::Boolean);
+
+        let point_array = create_array(
+            &[
+                Some("POINT (0.25 0.25)"),
+                Some("POINT (10 10)"),
+                None,
+                Some("POINT (0.25 0.25)"),
+            ],
+            &sedona_type,
+        );
+        let polygon_array = create_array(
+            &[
+                Some("POLYGON ((0 0, 1 0, 0 1, 0 0))"),
+                Some("POLYGON ((0 0, 1 0, 0 1, 0 0))"),
+                Some("POLYGON ((0 0, 1 0, 0 1, 0 0))"),
+                None,
+            ],
+            &sedona_type,
+        );
+
+        // Array, Array -> Array
+        let expected: ArrayRef = create_array!(Boolean, [Some(true), Some(false), None, None]);
+        assert_eq!(
+            &tester
+                .invoke_array_array(point_array, polygon_array)
+                .unwrap(),
+            &expected
+        );
+    }
+}

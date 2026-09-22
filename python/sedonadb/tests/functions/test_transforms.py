@@ -1,0 +1,386 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import geopandas
+import geopandas.testing
+import pyproj
+import pytest
+from sedonadb.testing import PostGIS, SedonaDB, geom_or_null, val_or_null
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_transform(eng):
+    eng = eng.create_or_skip()
+    eng.assert_query_result(
+        "SELECT ST_Transform(ST_GeomFromText('POINT (1 1)'), 'EPSG:4326', 'EPSG:3857')",
+        "POINT (111319.490793274 111325.142866385)",
+        wkt_precision=9,
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_transform_3d(eng):
+    eng = eng.create_or_skip()
+    eng.assert_query_result(
+        "SELECT ST_Transform(ST_GeomFromText('POINT Z (1 1 1)'), 'EPSG:4979', 'EPSG:4978')",
+        "POINT Z (6376201.805927448 111297.016517882 110568.792276973)",
+        wkt_precision=9,
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+@pytest.mark.parametrize(
+    ("geom", "srid", "expected_srid"),
+    [
+        ("POINT (1 1)", None, None),
+        ("POINT (1 1)", 3857, 3857),
+        ("POINT (1 1)", 0, None),
+    ],
+)
+def test_st_setsrid(eng, geom, srid, expected_srid):
+    eng = eng.create_or_skip()
+    result = eng.execute_and_collect(
+        f"SELECT ST_SetSrid({geom_or_null(geom)}, {val_or_null(srid)})"
+    )
+    df = eng.result_to_pandas(result)
+    if expected_srid is None:
+        assert df.crs is None
+    else:
+        assert df.crs == pyproj.CRS(expected_srid)
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+def test_st_setsrid_null_srid(eng):
+    """NULL SRID should produce NULL geometry per SQL NULL propagation."""
+    eng = eng.create_or_skip()
+    eng.assert_query_result(
+        "SELECT ST_SetSrid(ST_GeomFromText('POINT (1 1)'), NULL)",
+        [(None,)],
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+@pytest.mark.parametrize(
+    ("geom", "srid", "expected_srid"),
+    [
+        ("POINT (1 1)", 3857, 3857),
+        ("POINT (1 1)", 0, 0),
+    ],
+)
+def test_st_srid(eng, geom, srid, expected_srid):
+    eng = eng.create_or_skip()
+    eng.assert_query_result(
+        f"SELECT ST_SRID(ST_SetSrid({geom_or_null(geom)}, {val_or_null(srid)}))",
+        expected_srid,
+    )
+
+
+def test_st_transform_bind_crs(con):
+    # Check the two argument version
+    df = con.sql(
+        "SELECT ST_Transform(ST_Point(0, 1, 4326), $1) AS geom", params=("EPSG:3857",)
+    ).to_pandas()
+    expected = con.sql(
+        "SELECT ST_Transform(ST_Point(0, 1, 4326), 'EPSG:3857') AS geom"
+    ).to_pandas()
+    geopandas.testing.assert_geodataframe_equal(df, expected)
+
+    # Check the three argument version
+    df = con.sql(
+        "SELECT ST_Transform(ST_Point(0, 1), 4326, $1) AS geom", params=("EPSG:3857",)
+    ).to_pandas()
+    expected = con.sql(
+        "SELECT ST_Transform(ST_Point(0, 1), 4326, 'EPSG:3857') AS geom"
+    ).to_pandas()
+    geopandas.testing.assert_geodataframe_equal(df, expected)
+
+
+def test_st_set_crs_bind_crs(con):
+    df = con.sql(
+        "SELECT ST_SetCrs(ST_Point(0, 1), $1) AS geom", params=("EPSG:3857",)
+    ).to_pandas()
+    expected = con.sql(
+        "SELECT ST_SetCrs(ST_Point(0, 1), 'EPSG:3857') AS geom"
+    ).to_pandas()
+    geopandas.testing.assert_geodataframe_equal(df, expected)
+
+
+def test_st_set_srid_bind_srid(con):
+    df = con.sql(
+        "SELECT ST_SetSRID(ST_Point(0, 1), $1) AS geom", params=(3857,)
+    ).to_pandas()
+    expected = con.sql("SELECT ST_SetSRID(ST_Point(0, 1), 3857) AS geom").to_pandas()
+    geopandas.testing.assert_geodataframe_equal(df, expected)
+
+
+# PostGIS does not have an API ST_SetCrs, ST_Crs
+@pytest.mark.parametrize("eng", [SedonaDB])
+@pytest.mark.parametrize(
+    ("geom", "crs", "expected_srid"),
+    [
+        ("POINT (1 1)", "EPSG:26920", 26920),
+        ("POINT (1 1)", pyproj.CRS("EPSG:26920").to_json(), 26920),
+    ],
+)
+def test_st_setcrs_sedonadb(eng, geom, crs, expected_srid):
+    eng = eng.create_or_skip()
+    result = eng.execute_and_collect(f"SELECT ST_SetCrs({geom_or_null(geom)}, '{crs}')")
+    df = eng.result_to_pandas(result)
+    assert df.crs.to_epsg() == expected_srid
+
+
+# We haven't wired up the engines to use/support item-level CRS yet. This
+# will be easier when EWKB and/or EWKT is supported (and/or this concept
+# is supported in geoarrow.pyarrow, which we use for testing)
+def test_item_crs_sedonadb():
+    eng = SedonaDB()
+    df = geopandas.GeoDataFrame(
+        {
+            "srid": [4326, 4326, 3857, 3857, 0, 0],
+            "geometry": geopandas.GeoSeries.from_wkt(
+                [
+                    "POINT (0 1)",
+                    "POINT (2 3)",
+                    "POINT (4 5)",
+                    "POINT (6 7)",
+                    "POINT (8 9)",
+                    None,
+                ]
+            ),
+        }
+    )
+
+    eng.con.create_data_frame(df).to_view("df")
+    eng.con.sql("SELECT ST_SetSRID(geometry, srid) as item_crs FROM df").to_view(
+        "df_item_crs"
+    )
+
+    eng.assert_query_result(
+        "SELECT ST_SRID(item_crs) FROM df_item_crs",
+        [("4326",), ("4326",), ("3857",), ("3857",), ("0",), (None,)],
+    )
+
+    eng.assert_query_result(
+        "SELECT ST_Crs(item_crs) FROM df_item_crs",
+        [
+            ("OGC:CRS84",),
+            ("OGC:CRS84",),
+            ("EPSG:3857",),
+            ("EPSG:3857",),
+            ("0",),
+            (None,),
+        ],
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB])
+def test_st_crs_sedonadb(eng):
+    eng = eng.create_or_skip()
+    eng.assert_query_result(
+        "SELECT ST_CRS(ST_SetCrs(ST_GeomFromText('POINT (1 1)'), 'EPSG:26920'))",
+        "EPSG:26920",
+    )
+    eng.assert_query_result(
+        "SELECT ST_CRS(ST_SetCrs(ST_GeomFromText('POINT (1 1)'), NULL))",
+        None,
+    )
+
+
+# EPSG:3857 as WKT (carries an embedded EPSG authority) and a bespoke Lambert
+# Conformal Conic WKT with no authority code anywhere.
+WKT_3857 = (
+    'PROJCS["WGS 84 / Pseudo-Mercator",GEOGCS["WGS 84",DATUM["WGS_1984",'
+    'SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],'
+    'AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],'
+    'UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],'
+    'AUTHORITY["EPSG","4326"]],PROJECTION["Mercator_1SP"],'
+    'PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],'
+    'PARAMETER["false_easting",0],PARAMETER["false_northing",0],'
+    'UNIT["metre",1,AUTHORITY["EPSG","9001"]],AUTHORITY["EPSG","3857"]]'
+)
+WKT_LCC_NO_AUTHORITY = (
+    'PROJCS["Custom LCC",GEOGCS["WGS 84",DATUM["WGS_1984",'
+    'SPHEROID["WGS 84",6378137,298.257223563]]],'
+    'PROJECTION["Lambert_Conformal_Conic_2SP"],'
+    'PARAMETER["standard_parallel_1",33],PARAMETER["standard_parallel_2",45],'
+    'PARAMETER["latitude_of_origin",39],PARAMETER["central_meridian",-96],'
+    'UNIT["metre",1]]'
+)
+
+
+# WKT1/WKT2 CRS strings round-trip through ST_SetCrs/ST_Crs unchanged, whether
+# or not they carry an embedded authority. (ST_SetCrs/ST_Crs are SedonaDB-only.)
+@pytest.mark.parametrize("wkt", [WKT_3857, WKT_LCC_NO_AUTHORITY])
+def test_st_crs_wkt_roundtrips(con, wkt):
+    result = con.sql(
+        "SELECT ST_Crs(ST_SetCrs(ST_GeomFromText('POINT (0 1)'), $1)) AS crs",
+        params=(wkt,),
+    ).to_arrow_table()
+    assert result["crs"][0].as_py() == wkt
+
+
+def test_st_srid_from_wkt(con):
+    """A WKT carrying an EPSG authority resolves to that SRID."""
+    result = con.sql(
+        "SELECT ST_SRID(ST_SetCrs(ST_GeomFromText('POINT (0 1)'), $1)) AS srid",
+        params=(WKT_3857,),
+    ).to_arrow_table()
+    assert result["srid"][0].as_py() == 3857
+
+
+def test_st_srid_from_authorityless_wkt_errors(con):
+    """A WKT with no authority code anywhere has no SRID to extract."""
+    with pytest.raises(Exception, match="SRID"):
+        con.sql(
+            "SELECT ST_SRID(ST_SetCrs(ST_GeomFromText('POINT (0 1)'), $1))",
+            params=(WKT_LCC_NO_AUTHORITY,),
+        ).to_arrow_table()
+
+
+def test_st_transform_from_wkt_crs(con):
+    """A WKT CRS feeds the PROJ transform like any other CRS string: a point at
+    the EPSG:3857 coordinates of (lon 1, lat 1) transforms back to ~POINT (1 1)."""
+    df = con.sql(
+        "SELECT ST_Transform("
+        "ST_SetCrs(ST_GeomFromText('POINT (111319.490793274 111325.142866385)'), $1),"
+        " 'EPSG:4326') AS geom",
+        params=(WKT_3857,),
+    ).to_pandas()
+    point = df.geometry[0]
+    assert point.x == pytest.approx(1.0, abs=1e-6)
+    assert point.y == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+@pytest.mark.parametrize(
+    ("geom", "dx", "dy", "expected"),
+    [
+        # Nulls
+        (None, None, None, None),
+        (None, 1.0, 2.0, None),
+        ("POINT (0 1)", None, 2.0, None),
+        ("POINT (0 1)", 1.0, None, None),
+        ("POINT (0 1)", 1.0, 2.0, "POINT (1 3)"),  # Positives
+        ("POINT (0 1)", -1.0, -2.0, "POINT (-1 -1)"),  # Negatives
+        ("POINT (0 1)", 0.0, 0.0, "POINT (0 1)"),  # Zeroes
+        ("POINT (0 1)", 1, 2, "POINT (1 3)"),  # Integers
+        ("POINT Z (0 1 2)", 1.0, 2.0, "POINT Z (1 3 2)"),  # Z
+        ("POINT M (0 1 2)", 1.0, 2.0, "POINT M (1 3 2)"),  # M
+        ("POINT ZM (0 1 2 3)", 1.0, 2.0, "POINT ZM (1 3 2 3)"),  # ZM
+        # Not points
+        ("LINESTRING (0 1, 2 3)", 1.0, 2.0, "LINESTRING (1 3, 3 5)"),
+        ("POLYGON ((0 0, 1 0, 0 1, 0 0))", 1.0, 2.0, "POLYGON ((1 2, 2 2, 1 3, 1 2))"),
+        ("MULTIPOINT (0 1, 2 3)", 1.0, 2.0, "MULTIPOINT (1 3, 3 5)"),
+        ("MULTILINESTRING ((0 1, 2 3))", 1.0, 2.0, "MULTILINESTRING ((1 3, 3 5))"),
+        (
+            "MULTIPOLYGON (((0 0, 1 0, 0 1, 0 0)))",
+            1.0,
+            2.0,
+            "MULTIPOLYGON (((1 2, 2 2, 1 3, 1 2)))",
+        ),
+        (
+            "GEOMETRYCOLLECTION (POINT (0 1))",
+            1.0,
+            2.0,
+            "GEOMETRYCOLLECTION (POINT (1 3))",
+        ),
+        # WKT output of geoarrow-c is causing this (both correctly output
+        # empties)
+        ("POINT EMPTY", 1.0, 2.0, "POINT (nan nan)"),
+        ("POINT Z EMPTY", 1.0, 2.0, "POINT Z (nan nan nan)"),
+        ("LINESTRING EMPTY", 1.0, 2.0, "LINESTRING EMPTY"),
+        ("POLYGON EMPTY", 1.0, 2.0, "POLYGON EMPTY"),
+        ("MULTIPOINT EMPTY", 1.0, 2.0, "MULTIPOINT EMPTY"),
+        ("MULTILINESTRING EMPTY", 1.0, 2.0, "MULTILINESTRING EMPTY"),
+        ("MULTIPOLYGON EMPTY", 1.0, 2.0, "MULTIPOLYGON EMPTY"),
+        ("GEOMETRYCOLLECTION EMPTY", 1.0, 2.0, "GEOMETRYCOLLECTION EMPTY"),
+    ],
+)
+def test_st_translate(eng, geom, dx, dy, expected):
+    eng = eng.create_or_skip()
+    eng.assert_query_result(
+        f"SELECT ST_Translate({geom_or_null(geom)}, {val_or_null(dx)}, {val_or_null(dy)})",
+        expected,
+    )
+
+
+@pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
+@pytest.mark.parametrize(
+    ("geom", "dx", "dy", "dz", "expected"),
+    [
+        # Nulls
+        (None, None, None, None, None),
+        (None, 1.0, 2.0, 3.0, None),
+        ("POINT Z (0 1 2)", None, 2.0, 3.0, None),
+        ("POINT Z (0 1 2)", 1.0, None, 3.0, None),
+        ("POINT Z (0 1 2)", 1.0, 2.0, None, None),
+        ("POINT Z (0 1 2)", 1.0, 2.0, 3.0, "POINT Z (1 3 5)"),  # Positives
+        ("POINT Z (0 1 2)", -1.0, -2.0, -3.0, "POINT Z (-1 -1 -1)"),  # Negatives
+        ("POINT Z (0 1 2)", 0.0, 0.0, 0.0, "POINT Z (0 1 2)"),  # Zeroes
+        ("POINT Z (0 1 2)", 1, 2, 3, "POINT Z (1 3 5)"),  # Integers
+        ("POINT (0 1)", 1.0, 2.0, 3.0, "POINT (1 3)"),  # 2D
+        ("POINT M (0 1 2)", 1.0, 2.0, 3.0, "POINT M (1 3 2)"),  # M
+        ("POINT ZM (0 1 2 3)", 1.0, 2.0, 3.0, "POINT ZM (1 3 5 3)"),  # ZM
+        # Not points
+        ("LINESTRING Z (0 1 2, 2 3 4)", 1.0, 2.0, 3.0, "LINESTRING Z (1 3 5, 3 5 7)"),
+        (
+            "POLYGON Z ((0 0 0, 1 0 2, 0 1 2, 0 0 0))",
+            1.0,
+            2.0,
+            3.0,
+            "POLYGON Z ((1 2 3, 2 2 5, 1 3 5, 1 2 3))",
+        ),
+        ("MULTIPOINT Z (0 1 2, 2 3 4)", 1.0, 2.0, 3.0, "MULTIPOINT Z (1 3 5, 3 5 7)"),
+        (
+            "MULTILINESTRING Z ((0 1 2, 2 3 4))",
+            1.0,
+            2.0,
+            3.0,
+            "MULTILINESTRING Z ((1 3 5, 3 5 7))",
+        ),
+        (
+            "MULTIPOLYGON Z (((0 0 0, 1 0 2, 0 1 2, 0 0 0)))",
+            1.0,
+            2.0,
+            3.0,
+            "MULTIPOLYGON Z (((1 2 3, 2 2 5, 1 3 5, 1 2 3)))",
+        ),
+        (
+            "GEOMETRYCOLLECTION Z (POINT Z (0 1 2))",
+            1.0,
+            2.0,
+            3.0,
+            "GEOMETRYCOLLECTION Z (POINT Z (1 3 5))",
+        ),
+        # WKT output of geoarrow-c is causing this (both correctly output
+        # empties)
+        ("POINT EMPTY", 1.0, 2.0, 3.0, "POINT (nan nan)"),
+        ("POINT Z EMPTY", 1.0, 2.0, 3.0, "POINT Z (nan nan nan)"),
+        ("LINESTRING EMPTY", 1.0, 2.0, 3.0, "LINESTRING EMPTY"),
+        ("POLYGON EMPTY", 1.0, 2.0, 3.0, "POLYGON EMPTY"),
+        ("MULTIPOINT EMPTY", 1.0, 2.0, 3.0, "MULTIPOINT EMPTY"),
+        ("MULTILINESTRING EMPTY", 1.0, 2.0, 3.0, "MULTILINESTRING EMPTY"),
+        ("MULTIPOLYGON EMPTY", 1.0, 2.0, 3.0, "MULTIPOLYGON EMPTY"),
+        ("GEOMETRYCOLLECTION EMPTY", 1.0, 2.0, 3.0, "GEOMETRYCOLLECTION EMPTY"),
+    ],
+)
+def test_st_translate_3d(eng, geom, dx, dy, dz, expected):
+    eng = eng.create_or_skip()
+    eng.assert_query_result(
+        f"SELECT ST_Translate({geom_or_null(geom)}, {val_or_null(dx)}, {val_or_null(dy)}, {val_or_null(dz)})",
+        expected,
+    )

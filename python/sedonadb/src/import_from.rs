@@ -1,0 +1,352 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+use std::{
+    ffi::{c_void, CString},
+    sync::Arc,
+    time::Duration,
+};
+
+use arrow_array::{
+    ffi::{FFI_ArrowArray, FFI_ArrowSchema},
+    ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream},
+    make_array, ArrayRef, RecordBatchReader,
+};
+use arrow_schema::{Field, Schema};
+use datafusion::catalog::TableProvider;
+use datafusion_common::{metadata::ScalarAndMetadata, ScalarValue};
+use datafusion_expr::expr::FieldMetadata;
+use pyo3::{
+    types::{PyAnyMethods, PyCapsule, PyCapsuleMethods},
+    Bound, PyAny, Python,
+};
+use sedona::record_batch_reader_provider::RecordBatchReaderProvider;
+use sedona_expr::scalar_udf::ScalarKernelRef;
+use sedona_extension::{
+    extension::SedonaCScalarKernel, extension::SedonaCTableProvider,
+    scalar_kernel::ImportedScalarKernel, table_provider::ImportedTableProvider,
+};
+use sedona_schema::{
+    datatypes::SedonaType,
+    matchers::{ArgMatcher, TypeMatcher},
+};
+
+use crate::error::PySedonaError;
+
+pub fn import_table_provider_from_any<'py>(
+    py: Python<'py>,
+    obj: &Bound<PyAny>,
+    requested_schema: Option<&Bound<PyAny>>,
+) -> Result<Arc<dyn TableProvider>, PySedonaError> {
+    if obj.hasattr("__sedonadb_table_provider__")? {
+        let provider = import_sedona_ffi_table_provider(obj)?;
+        Ok(provider)
+    } else if obj.hasattr("__arrow_c_stream__")? {
+        let reader = import_arrow_array_stream(py, obj, requested_schema)?;
+        Ok(Arc::new(RecordBatchReaderProvider::new(reader)))
+    } else {
+        Err(PySedonaError::SedonaPython(
+            "Can't create SedonaDB table from object".to_string(),
+        ))
+    }
+}
+
+pub fn import_sedona_ffi_table_provider(
+    obj: &Bound<PyAny>,
+) -> Result<Arc<dyn TableProvider>, PySedonaError> {
+    let capsule = obj.getattr("__sedonadb_table_provider__")?.call0()?;
+    let contents =
+        check_pycapsule(&capsule, "sedonadb_table_provider")? as *mut SedonaCTableProvider;
+
+    // Move the SedonaCTableProvider out of the capsule into our ImportedTableProvider.
+    // Clear the structure after reading to prevent double-free when the capsule is dropped.
+    let ffi_provider = unsafe {
+        let provider = std::ptr::read(contents);
+        // Clear the entire structure to prevent any accidental use
+        std::ptr::write_bytes(contents, 0, 1);
+        provider
+    };
+    // try_new validates the release callback
+    let provider = ImportedTableProvider::try_new(ffi_provider)?;
+
+    // Add a Python-aware cancel checker that checks for Ctrl+C signals
+    // Use a 2 second interval to match the StreamingRecordBatchReader behavior
+    let provider = provider
+        .with_cancel_checker(|| {
+            Python::attach(|py| {
+                // Run `pass` to process any pending signals, then check for errors
+                if py.run(cr"pass", None, None).is_err() {
+                    return true;
+                }
+                py.check_signals().is_err()
+            })
+        })
+        .with_check_interval(Duration::from_millis(2_000));
+
+    Ok(Arc::new(provider))
+}
+
+/// Import a natively-compiled scalar kernel from a `PyCapsule` wrapping a
+/// [`SedonaCScalarKernel`] -- the same Arrow-C-Data-Interface-style ABI
+/// (opaque pointer + function-pointer vtable + explicit release) already
+/// used by `sedona-extension` to statically link in kernels at build time
+/// (see `c/sedona-s2geography`); this is the runtime counterpart, letting an
+/// out-of-tree plugin hand in a real `SedonaScalarKernel` -- no Python
+/// callback per invocation -- via `__sedonadb_scalar_udf__`.
+///
+/// Returns the kernel's own declared name (read from the capsule via
+/// [`ImportedScalarKernel::function_name`], not supplied by the caller) so
+/// the overload kernels of one function can be grouped into a single
+/// overloaded [`sedona_expr::scalar_udf::SedonaScalarUDF`] by the caller, the
+/// same way [`sedona::context::SedonaContext::register_scalar_kernels`]
+/// already groups statically-linked kernels.
+pub fn import_sedona_ffi_scalar_kernel(
+    obj: &Bound<PyAny>,
+) -> Result<(String, ScalarKernelRef), PySedonaError> {
+    let contents = check_pycapsule(obj, "sedonadb_scalar_kernel")? as *mut SedonaCScalarKernel;
+
+    // Move the SedonaCScalarKernel out of the capsule into our
+    // ImportedScalarKernel. Clear the structure after reading to prevent
+    // double-free when the capsule is dropped -- same pattern as
+    // import_sedona_ffi_table_provider above.
+    let ffi_kernel = unsafe {
+        let kernel = std::ptr::read(contents);
+        std::ptr::write_bytes(contents, 0, 1);
+        kernel
+    };
+    let imported = ImportedScalarKernel::try_from(ffi_kernel)?;
+    let name = imported
+        .function_name()
+        .ok_or_else(|| {
+            PySedonaError::SedonaPython(
+                "native scalar kernel capsule has no function name".to_string(),
+            )
+        })?
+        .to_string();
+
+    Ok((name, Arc::new(imported)))
+}
+
+pub fn import_arrow_array_stream<'py>(
+    py: Python<'py>,
+    obj: &Bound<PyAny>,
+    requested_schema: Option<&Bound<PyAny>>,
+) -> Result<Box<dyn RecordBatchReader + Send>, PySedonaError> {
+    let capsule = if let Some(requested_schema) = requested_schema {
+        let schema = import_arrow_schema(requested_schema)?;
+        let ffi_schema = FFI_ArrowSchema::try_from(schema)?;
+        let ffi_schema_capsule = PyCapsule::new_with_value(py, ffi_schema, c"arrow_schema")?;
+
+        obj.getattr("__arrow_c_stream__")?
+            .call1((ffi_schema_capsule,))?
+    } else {
+        obj.getattr("__arrow_c_stream__")?.call0()?
+    };
+
+    let stream = unsafe {
+        FFI_ArrowArrayStream::from_raw(check_pycapsule(&capsule, "arrow_array_stream")? as _)
+    };
+
+    let stream_reader = ArrowArrayStreamReader::try_new(stream)?;
+    Ok(Box::new(stream_reader))
+}
+
+pub fn import_arrow_array(obj: &Bound<PyAny>) -> Result<(Field, ArrayRef), PySedonaError> {
+    let schema_and_array = obj.getattr("__arrow_c_array__")?.call0()?;
+    let (schema_capsule, array_capsule): (Bound<PyCapsule>, Bound<PyCapsule>) =
+        schema_and_array.extract()?;
+
+    let ffi_schema = unsafe {
+        FFI_ArrowSchema::from_raw(check_pycapsule(&schema_capsule, "arrow_schema")? as _)
+    };
+    let ffi_array =
+        unsafe { FFI_ArrowArray::from_raw(check_pycapsule(&array_capsule, "arrow_array")? as _) };
+
+    let result_field = Field::try_from(&ffi_schema)?;
+    let result_array_data = unsafe { arrow_array::ffi::from_ffi(ffi_array, &ffi_schema)? };
+
+    Ok((result_field, make_array(result_array_data)))
+}
+
+pub fn import_arrow_scalar(obj: &Bound<PyAny>) -> Result<ScalarAndMetadata, PySedonaError> {
+    let (field, array) = import_arrow_array(obj)?;
+    if array.len() != 1 {
+        return Err(PySedonaError::SedonaPython(format!(
+            "Expected Arrow scalar input to be of length 1 but got length {}",
+            array.len()
+        )));
+    }
+
+    let metadata = FieldMetadata::new_from_field(&field);
+    let scalar_value = ScalarValue::try_from_array(&array, 0)?;
+    if metadata.is_empty() {
+        Ok(ScalarAndMetadata::new(scalar_value, None))
+    } else {
+        Ok(ScalarAndMetadata::new(scalar_value, Some(metadata)))
+    }
+}
+
+pub fn import_arg_matcher(
+    obj: &Bound<PyAny>,
+) -> Result<Arc<dyn TypeMatcher + Send + Sync>, PySedonaError> {
+    if let Ok(string_value) = obj.extract::<String>() {
+        match string_value.as_str() {
+            "geometry" => return Ok(ArgMatcher::is_geometry()),
+            "geography" => return Ok(ArgMatcher::is_geography()),
+            "numeric" => return Ok(ArgMatcher::is_numeric()),
+            "string" => return Ok(ArgMatcher::is_string()),
+            "binary" => return Ok(ArgMatcher::is_binary()),
+            "boolean" => return Ok(ArgMatcher::is_boolean()),
+            v => {
+                return Err(PySedonaError::SedonaPython(format!(
+                    "Can't interpret literal string '{v}' as ArgMatcher"
+                )))
+            }
+        }
+    }
+
+    let sedona_type = import_sedona_type(obj)?;
+    Ok(ArgMatcher::is_exact(sedona_type))
+}
+
+pub fn import_sedona_type(obj: &Bound<PyAny>) -> Result<SedonaType, PySedonaError> {
+    let field = import_arrow_field(obj)?;
+    Ok(SedonaType::from_storage_field(&field)?)
+}
+
+pub fn import_arrow_field(obj: &Bound<PyAny>) -> Result<Field, PySedonaError> {
+    let capsule = obj.getattr("__arrow_c_schema__")?.call0()?;
+    let schema =
+        unsafe { FFI_ArrowSchema::from_raw(check_pycapsule(&capsule, "arrow_schema")? as _) };
+
+    Ok(Field::try_from(&schema)?)
+}
+
+pub fn import_arrow_schema(obj: &Bound<PyAny>) -> Result<Schema, PySedonaError> {
+    let capsule = obj.getattr("__arrow_c_schema__")?.call0()?;
+    let schema =
+        unsafe { FFI_ArrowSchema::from_raw(check_pycapsule(&capsule, "arrow_schema")? as _) };
+
+    Ok(Schema::try_from(&schema)?)
+}
+
+pub fn check_pycapsule(obj: &Bound<PyAny>, name: &str) -> Result<*mut c_void, PySedonaError> {
+    let capsule = obj
+        .cast::<PyCapsule>()
+        .map_err(|e| PySedonaError::SedonaPython(e.to_string()))?;
+
+    // Validate name and get pointer in one step
+    let name_cstr = CString::new(name).map_err(|e| PySedonaError::SedonaPython(e.to_string()))?;
+    let pointer = capsule
+        .pointer_checked(Some(&name_cstr))
+        .map_err(|e| PySedonaError::SedonaPython(e.to_string()))?;
+
+    Ok(pointer.as_ptr())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::DataType;
+    use sedona_expr::scalar_udf::SimpleSedonaScalarKernel;
+    use sedona_extension::{extension::SedonaCScalarKernel, scalar_kernel::ExportedScalarKernel};
+
+    /// A trivial real kernel (matches any single numeric arg, returns it
+    /// unchanged), exported to a `SedonaCScalarKernel` and wrapped in a real
+    /// `PyCapsule` -- the exact same export path `sedona-extension`'s own
+    /// `ffi_roundtrip`/`named_kernel` tests already prove correct end to
+    /// end. `#[dev-dependencies] pyo3 = { features = ["auto-initialize"] }`
+    /// is what makes `Python::attach` usable here at all: `extension-module`
+    /// (needed for the real wheel build) is only ever added by maturin's own
+    /// build flags, never by this crate's Cargo.toml, so it's never present
+    /// during `cargo test`.
+    fn capsule_with_named_kernel<'py>(
+        py: Python<'py>,
+        function_name: &str,
+    ) -> Bound<'py, PyCapsule> {
+        let kernel = SimpleSedonaScalarKernel::new_ref(
+            ArgMatcher::new(
+                vec![ArgMatcher::is_numeric()],
+                SedonaType::Arrow(DataType::Int64),
+            ),
+            Arc::new(|_, args| Ok(args[0].clone())),
+        );
+        let exported = ExportedScalarKernel::from(kernel).with_function_name(function_name);
+        let ffi_kernel = SedonaCScalarKernel::from(exported);
+        PyCapsule::new_with_value(py, ffi_kernel, c"sedonadb_scalar_kernel").unwrap()
+    }
+
+    #[test]
+    fn import_sedona_ffi_scalar_kernel_reads_the_declared_name_and_works() {
+        Python::initialize();
+        Python::attach(|py| {
+            let capsule = capsule_with_named_kernel(py, "test_kernel");
+            let (name, kernel) = import_sedona_ffi_scalar_kernel(capsule.as_any()).unwrap();
+            assert_eq!(name, "test_kernel");
+
+            // Not just a name round-trip -- the imported kernel is a real,
+            // callable SedonaScalarKernel.
+            let sedona_type = SedonaType::Arrow(DataType::Int64);
+            let resolved = kernel
+                .return_type_from_args_and_scalars(std::slice::from_ref(&sedona_type), &[None])
+                .unwrap();
+            assert_eq!(resolved, Some(sedona_type));
+        });
+    }
+
+    #[test]
+    fn import_sedona_ffi_scalar_kernel_rejects_wrong_capsule_name() {
+        Python::initialize();
+        Python::attach(|py| {
+            let kernel = SimpleSedonaScalarKernel::new_ref(
+                ArgMatcher::new(
+                    vec![ArgMatcher::is_numeric()],
+                    SedonaType::Arrow(DataType::Int64),
+                ),
+                Arc::new(|_, args| Ok(args[0].clone())),
+            );
+            let exported = ExportedScalarKernel::from(kernel);
+            let ffi_kernel = SedonaCScalarKernel::from(exported);
+            // Wrong capsule name -- e.g. a __sedonadb_table_provider__
+            // capsule accidentally handed to the scalar-kernel importer.
+            let capsule = PyCapsule::new_with_value(py, ffi_kernel, c"some_other_name").unwrap();
+            assert!(import_sedona_ffi_scalar_kernel(capsule.as_any()).is_err());
+        });
+    }
+
+    #[test]
+    fn import_sedona_ffi_scalar_kernel_rejects_double_import_safely() {
+        // The capsule's contents are zeroed on first read to prevent a
+        // double-free when the PyCapsule's own destructor later runs.
+        // Reading it again must fail cleanly, not read garbage or crash.
+        Python::initialize();
+        Python::attach(|py| {
+            let capsule = capsule_with_named_kernel(py, "test_kernel");
+            import_sedona_ffi_scalar_kernel(capsule.as_any()).unwrap();
+            let second = import_sedona_ffi_scalar_kernel(capsule.as_any());
+            assert!(second.is_err());
+        });
+    }
+
+    #[test]
+    fn import_sedona_ffi_scalar_kernel_rejects_non_capsule_input() {
+        Python::initialize();
+        Python::attach(|py| {
+            let not_a_capsule = py.eval(c"42", None, None).unwrap();
+            assert!(import_sedona_ffi_scalar_kernel(&not_a_capsule).is_err());
+        });
+    }
+}

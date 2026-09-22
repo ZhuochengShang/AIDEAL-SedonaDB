@@ -1,0 +1,59 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+[package]
+name = "sedona-s2geography"
+version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description.workspace = true
+readme.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[build-dependencies]
+cmake = { version = "0.1" }
+regex = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rstest = { workspace = true }
+sedona = { workspace = true }
+sedona-testing = { workspace = true, features = ["criterion"] }
+
+[dependencies]
+arrow-schema = { workspace = true }
+arrow-array = { workspace = true, features = ["ffi"] }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+errno = { version = "0.3" }
+geo-traits = { workspace = true }
+sedona-common = { workspace = true }
+sedona-expr = { workspace = true }
+sedona-extension = { workspace = true }
+sedona-functions = { workspace = true }
+sedona-geometry = { workspace = true }
+sedona-schema = { workspace = true }
+thiserror = { workspace = true }
+paste = "1.0.15"
+
+[[bench]]
+harness = false
+name = "s2geography-functions"

@@ -1,0 +1,202 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+use std::sync::Arc;
+
+use crate::st_distance::point_or_wkb_distance;
+use arrow_array::builder::BooleanBuilder;
+use arrow_schema::DataType;
+use datafusion_common::{cast::as_float64_array, error::Result};
+use datafusion_expr::ColumnarValue;
+use sedona_expr::{
+    item_crs::ItemCrsKernel,
+    scalar_udf::{ScalarKernelRef, SedonaScalarKernel},
+};
+use sedona_functions::executor::PointXYExecutor;
+use sedona_schema::{datatypes::SedonaType, matchers::ArgMatcher};
+
+/// ST_DWithin() implementation using [DistanceExt]
+pub fn st_dwithin_impl() -> Vec<ScalarKernelRef> {
+    ItemCrsKernel::wrap_impl(STDWithin {})
+}
+
+#[derive(Debug)]
+struct STDWithin {}
+
+impl SedonaScalarKernel for STDWithin {
+    fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+        let matcher = ArgMatcher::new(
+            vec![
+                ArgMatcher::is_geometry(),
+                ArgMatcher::is_geometry(),
+                ArgMatcher::is_numeric(),
+            ],
+            SedonaType::Arrow(DataType::Boolean),
+        );
+
+        matcher.match_args(args)
+    }
+
+    fn invoke_batch(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+    ) -> Result<ColumnarValue> {
+        let arg2 = args[2].cast_to(&DataType::Float64, None)?;
+        // Same PointXY fast path as ST_Distance's backend: Point/Point pairs
+        // skip the parse; the bound comparison is `distance <= bound`.
+        let executor = PointXYExecutor::new(arg_types, args);
+        let arg2_array = arg2.to_array(executor.num_iterations())?;
+        let arg2_f64_array = as_float64_array(&arg2_array)?;
+        let mut arg2_iter = arg2_f64_array.iter();
+        let mut builder = BooleanBuilder::with_capacity(executor.num_iterations());
+        executor.execute_wkb_wkb_void(|maybe0, maybe1| {
+            match (maybe0, maybe1, arg2_iter.next().unwrap()) {
+                (Some(a), Some(b), Some(bound)) => {
+                    builder.append_value(point_or_wkb_distance(a, b) <= bound);
+                }
+                _ => builder.append_null(),
+            }
+
+            Ok(())
+        })?;
+
+        executor.finish(Arc::new(builder.finish()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{create_array as arrow_array, ArrayRef};
+    use datafusion_common::scalar::ScalarValue;
+    use rstest::rstest;
+    use sedona_expr::scalar_udf::SedonaScalarUDF;
+    use sedona_schema::datatypes::{WKB_GEOMETRY, WKB_GEOMETRY_ITEM_CRS, WKB_VIEW_GEOMETRY};
+    use sedona_testing::create::create_scalar;
+    use sedona_testing::testers::ScalarUdfTester;
+    use sedona_testing::{compare::assert_array_equal, create::create_array};
+
+    use super::*;
+
+    #[rstest]
+    fn udf(
+        #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY, WKB_GEOMETRY_ITEM_CRS.clone())] left_sedona_type: SedonaType,
+        #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY, WKB_GEOMETRY_ITEM_CRS.clone())] right_sedona_type: SedonaType,
+    ) {
+        let udf = SedonaScalarUDF::from_impl("st_dwithin", st_dwithin_impl());
+        let tester = ScalarUdfTester::new(
+            udf.into(),
+            vec![
+                left_sedona_type.clone(),
+                right_sedona_type.clone(),
+                SedonaType::Arrow(DataType::Float64),
+            ],
+        );
+
+        assert_eq!(
+            tester.return_type().unwrap(),
+            SedonaType::Arrow(DataType::Boolean)
+        );
+
+        // Test points within distance (3-4-5 triangle, distance = 5.0)
+        let point_0_0 = create_scalar(Some("POINT (0 0)"), &left_sedona_type);
+        let point_3_4 = create_scalar(Some("POINT (3 4)"), &right_sedona_type);
+        let distance_5 = ScalarValue::Float64(Some(5.0));
+        let distance_4 = ScalarValue::Float64(Some(4.0));
+
+        let result = tester
+            .invoke_scalar_scalar_scalar(point_0_0.clone(), point_3_4.clone(), distance_5.clone())
+            .unwrap();
+        assert_eq!(result, ScalarValue::Boolean(Some(true)));
+
+        // Test points outside distance
+        let result = tester
+            .invoke_scalar_scalar_scalar(point_0_0.clone(), point_3_4.clone(), distance_4.clone())
+            .unwrap();
+        assert_eq!(result, ScalarValue::Boolean(Some(false)));
+
+        // Test with null values
+        let result = tester
+            .invoke_scalar_scalar_scalar(ScalarValue::Null, point_3_4.clone(), distance_5.clone())
+            .unwrap();
+        assert!(result.is_null());
+        let result = tester
+            .invoke_scalar_scalar_scalar(point_0_0.clone(), ScalarValue::Null, distance_5.clone())
+            .unwrap();
+        assert!(result.is_null());
+
+        // Test with null distance
+        let result = tester
+            .invoke_scalar_scalar_scalar(
+                point_0_0.clone(),
+                point_3_4.clone(),
+                ScalarValue::Float64(None),
+            )
+            .unwrap();
+        assert!(result.is_null());
+
+        // Test with array args
+        let arg1 = create_array(
+            &[
+                Some("POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))"),
+                Some("POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))"),
+                None,
+                Some("POINT EMPTY"),
+            ],
+            &left_sedona_type,
+        );
+        let arg2 = create_array(
+            &[
+                Some("POINT (0.5 0.5)"),
+                Some("POINT (5 5)"),
+                Some("POINT (0 0)"),
+                Some("POINT EMPTY"),
+            ],
+            &right_sedona_type,
+        );
+        let distance = arrow_array!(Int32, [Some(1), Some(1), Some(1), Some(1)]);
+        let expected: ArrayRef = arrow_array!(Boolean, [Some(true), Some(false), None, Some(true)]);
+        assert_array_equal(
+            &tester.invoke_arrays(vec![arg1, arg2, distance]).unwrap(),
+            &expected,
+        );
+    }
+
+    #[rstest]
+    fn crossing_linestrings_are_dwithin_zero(
+        #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY, WKB_GEOMETRY_ITEM_CRS.clone())] left: SedonaType,
+        #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY, WKB_GEOMETRY_ITEM_CRS.clone())] right: SedonaType,
+    ) {
+        let udf = SedonaScalarUDF::from_impl("st_dwithin", st_dwithin_impl());
+        let tester = ScalarUdfTester::new(
+            udf.into(),
+            vec![
+                left.clone(),
+                right.clone(),
+                SedonaType::Arrow(DataType::Float64),
+            ],
+        );
+        let result = tester
+            .invoke_scalar_scalar_scalar(
+                create_scalar(Some("LINESTRING (0 0, 2 2)"), &left),
+                create_scalar(Some("LINESTRING (0 2, 2 0)"), &right),
+                0.0,
+            )
+            .unwrap();
+
+        assert_eq!(result, ScalarValue::Boolean(Some(true)));
+    }
+}

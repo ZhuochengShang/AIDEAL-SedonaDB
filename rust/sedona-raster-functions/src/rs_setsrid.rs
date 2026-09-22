@@ -1,0 +1,726 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::sync::Arc;
+
+use arrow_array::builder::StringViewBuilder;
+use arrow_array::{Array, ArrayRef, StringViewArray, StructArray};
+use arrow_buffer::NullBuffer;
+use arrow_schema::DataType;
+use datafusion_common::cast::{as_int64_array, as_string_view_array};
+use datafusion_common::error::Result;
+use datafusion_common::{DataFusionError, ScalarValue};
+use datafusion_expr::{ColumnarValue, Volatility};
+use sedona_common::{sedona_internal_datafusion_err, sedona_internal_err};
+use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
+use sedona_geometry::transform::CrsEngine;
+use sedona_raster::array::{with_column_overrides, RasterColumnOverrides};
+use sedona_raster::traits::Override;
+use sedona_schema::crs::{normalize_crs, CachedSRIDToCrs};
+use sedona_schema::datatypes::SedonaType;
+use sedona_schema::matchers::ArgMatcher;
+
+/// RS_SetSRID() scalar UDF implementation
+///
+/// An implementation of RS_SetSRID providing a scalar function implementation
+/// based on an optional [CrsEngine]. If provided, it will be used to validate
+/// the provided SRID (otherwise, all SRID input is applied without validation).
+pub fn rs_set_srid_with_engine_udf(
+    engine: Option<Arc<dyn CrsEngine + Send + Sync>>,
+) -> SedonaScalarUDF {
+    SedonaScalarUDF::new(
+        "rs_setsrid",
+        vec![Arc::new(RsSetSrid { engine })],
+        Volatility::Immutable,
+    )
+}
+
+/// RS_SetCRS() scalar UDF implementation
+///
+/// An implementation of RS_SetCRS providing a scalar function implementation
+/// based on an optional [CrsEngine]. If provided, it will be used to validate
+/// the provided CRS (otherwise, all CRS input is applied without validation).
+pub fn rs_set_crs_with_engine_udf(
+    engine: Option<Arc<dyn CrsEngine + Send + Sync>>,
+) -> SedonaScalarUDF {
+    SedonaScalarUDF::new(
+        "rs_setcrs",
+        vec![Arc::new(RsSetCrs { engine })],
+        Volatility::Immutable,
+    )
+}
+
+/// RS_SetSRID() scalar UDF implementation without CRS validation
+///
+/// See [rs_set_srid_with_engine_udf] for a validating version of this function
+pub fn rs_set_srid_udf() -> SedonaScalarUDF {
+    rs_set_srid_with_engine_udf(None)
+}
+
+/// RS_SetCRS() scalar UDF implementation without CRS validation
+///
+/// See [rs_set_crs_with_engine_udf] for a validating version of this function
+pub fn rs_set_crs_udf() -> SedonaScalarUDF {
+    rs_set_crs_with_engine_udf(None)
+}
+
+// ---------------------------------------------------------------------------
+// RS_SetSRID kernel
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct RsSetSrid {
+    engine: Option<Arc<dyn CrsEngine + Send + Sync>>,
+}
+
+impl SedonaScalarKernel for RsSetSrid {
+    fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+        let matcher = ArgMatcher::new(
+            vec![ArgMatcher::is_raster(), ArgMatcher::is_integer()],
+            SedonaType::Raster,
+        );
+        matcher.match_args(args)
+    }
+
+    fn invoke_batch(
+        &self,
+        _arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+    ) -> Result<ColumnarValue> {
+        let raster_arg = &args[0];
+        let srid_arg = &args[1];
+
+        let input_nulls = extract_input_nulls(srid_arg);
+
+        // Convert SRID integer(s) to CRS string(s)
+        let crs_columnar = srid_to_crs_columnar(srid_arg, self.engine.as_ref())?;
+
+        replace_raster_crs(raster_arg, &crs_columnar, input_nulls)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RS_SetCRS kernel
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct RsSetCrs {
+    engine: Option<Arc<dyn CrsEngine + Send + Sync>>,
+}
+
+impl SedonaScalarKernel for RsSetCrs {
+    fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+        let matcher = ArgMatcher::new(
+            vec![ArgMatcher::is_raster(), ArgMatcher::is_string()],
+            SedonaType::Raster,
+        );
+        matcher.match_args(args)
+    }
+
+    fn invoke_batch(
+        &self,
+        _arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+    ) -> Result<ColumnarValue> {
+        let raster_arg = &args[0];
+        let crs_arg = &args[1];
+
+        let input_nulls = extract_input_nulls(crs_arg);
+
+        // Normalize the CRS string(s) — preserve the full definition, map "0" to null
+        let crs_columnar = normalize_crs_columnar(crs_arg, self.engine.as_ref())?;
+
+        replace_raster_crs(raster_arg, &crs_columnar, input_nulls)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Core: zero-copy CRS column swap
+// ---------------------------------------------------------------------------
+
+/// Replace the CRS column of a raster StructArray with a new CRS value.
+///
+/// This is a zero-copy operation for the metadata and bands columns:
+/// we clone the Arc pointers for columns 0 (metadata) and 2 (bands),
+/// and only rebuild column 1 (CRS) from the provided value.
+///
+/// When `input_nulls` is provided, rows where the original SRID/CRS input was
+/// null will have the entire raster nulled out (not just the CRS column).
+fn replace_raster_crs(
+    raster_arg: &ColumnarValue,
+    crs_array: &StringViewArray,
+    input_nulls: Option<NullBuffer>,
+) -> Result<ColumnarValue> {
+    // Array-level edit: only the CRS column is rebuilt. Every other column —
+    // crucially the bands — is carried over as the same `Arc`, so the pixel
+    // bytes are untouched by construction rather than rebuilt.
+    let edit = |raster_struct: &StructArray| -> Result<StructArray> {
+        let crs: ArrayRef = broadcast_string_view(crs_array, raster_struct.len())?;
+        with_column_overrides(
+            raster_struct,
+            RasterColumnOverrides {
+                crs: Override::Set(crs),
+                ..Default::default()
+            },
+            input_nulls.as_ref(),
+        )
+        .map_err(DataFusionError::from)
+    };
+
+    match raster_arg {
+        ColumnarValue::Array(raster_array) => {
+            let raster_struct = raster_array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    sedona_internal_datafusion_err!("Expected StructArray for raster data")
+                })?;
+            Ok(ColumnarValue::Array(Arc::new(edit(raster_struct)?)))
+        }
+        ColumnarValue::Scalar(ScalarValue::Struct(arc_struct)) => Ok(ColumnarValue::Scalar(
+            ScalarValue::Struct(Arc::new(edit(arc_struct.as_ref())?)),
+        )),
+        _ => sedona_internal_err!("Expected raster array or struct scalar"),
+    }
+}
+
+/// If the array already has the target length, it is returned as-is (clone of Arc).
+/// Otherwise the array must have length 1, and its single value is repeated.
+fn broadcast_string_view(array: &StringViewArray, len: usize) -> Result<ArrayRef> {
+    if array.len() == len {
+        return Ok(Arc::new(array.clone()));
+    }
+
+    if array.len() != 1 {
+        return sedona_internal_err!(
+            "Expected array of length {len} or 1 but got {}",
+            array.len()
+        );
+    }
+
+    if array.is_null(0) {
+        Ok(Arc::new(StringViewArray::new_null(len)))
+    } else {
+        let value = array.value(0);
+        let mut builder = StringViewBuilder::with_capacity(len);
+        builder.try_append_value_n(value, len)?;
+        Ok(Arc::new(builder.finish()))
+    }
+}
+
+/// Extract a [NullBuffer] from the original SRID/CRS input argument.
+///
+/// For arrays, this returns the array's null buffer directly.
+/// For scalars, this returns a single-element null buffer if the scalar is null.
+///
+/// This is used to distinguish "input was null" (which should null the raster)
+/// from "input mapped to null CRS" (e.g. SRID=0 or CRS="0", which should
+/// clear the CRS but preserve the raster).
+fn extract_input_nulls(input: &ColumnarValue) -> Option<NullBuffer> {
+    match input {
+        ColumnarValue::Array(array) => array.nulls().cloned(),
+        ColumnarValue::Scalar(scalar) => {
+            if scalar.is_null() {
+                Some(NullBuffer::new_null(1))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SRID-to-CRS conversion
+// ---------------------------------------------------------------------------
+
+/// Convert an SRID integer ColumnarValue to a CRS StringViewArray ColumnarValue.
+///
+/// Uses [CachedSRIDToCrs] to avoid repeated validation of the same SRID within a batch.
+///
+/// Mapping:
+/// - 0 -> null (no CRS)
+/// - 4326 -> "OGC:CRS84"
+/// - other -> "EPSG:{srid}"
+fn srid_to_crs_columnar(
+    srid_arg: &ColumnarValue,
+    maybe_engine: Option<&Arc<dyn CrsEngine + Send + Sync>>,
+) -> Result<StringViewArray> {
+    let mut srid_to_crs = CachedSRIDToCrs::new();
+
+    // Cast to Int64 for uniform handling
+    let int_value = srid_arg.cast_to(&DataType::Int64, None)?;
+    let int_array_ref = ColumnarValue::values_to_arrays(&[int_value])?;
+    let int_array = as_int64_array(&int_array_ref[0])?;
+
+    let crs_array: StringViewArray = int_array
+        .iter()
+        .map(|maybe_srid| -> Result<Option<String>> {
+            if let Some(srid) = maybe_srid {
+                let Some(auth_code) = srid_to_crs.get_crs(srid)? else {
+                    return Ok(None);
+                };
+                validate_crs(&auth_code, maybe_engine)?;
+                Ok(Some(auth_code))
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<_>>()?;
+
+    Ok(crs_array)
+}
+
+// ---------------------------------------------------------------------------
+// CRS string normalization
+// ---------------------------------------------------------------------------
+
+/// Normalize a CRS string ColumnarValue — preserve the full definition, and
+/// map "0" to null.
+///
+/// Handles the scalar and array cases distinctly, because raster batches are
+/// typically high-cardinality in records but low-cardinality in CRS:
+/// - A scalar CRS is normalized once and returned as a single-element array.
+///   `broadcast_string_view` later fans it out to the raster's row count with
+///   `try_append_value_n`, so the (possibly large) definition is stored once
+///   regardless of how many rasters share it.
+/// - An array CRS is normalized per row with a deduplicating builder: a column
+///   of many rasters usually carries only a handful of distinct definitions, so
+///   each is stored once in the shared view buffer and shared across rows.
+///
+/// Parsing is memoized by [deserialize_crs]'s thread-local cache via
+/// [normalize_crs], so repeated definitions in a batch aren't re-parsed.
+fn normalize_crs_columnar(
+    crs_arg: &ColumnarValue,
+    _maybe_engine: Option<&Arc<dyn CrsEngine + Send + Sync>>,
+) -> Result<StringViewArray> {
+    match crs_arg {
+        ColumnarValue::Scalar(scalar) => {
+            let normalized = match scalar.cast_to(&DataType::Utf8)? {
+                ScalarValue::Utf8(Some(crs_str)) => normalize_crs(&crs_str)?,
+                _ => None,
+            };
+            Ok(std::iter::once(normalized).collect())
+        }
+        ColumnarValue::Array(_) => {
+            let string_value = crs_arg.cast_to(&DataType::Utf8View, None)?;
+            let string_array_ref = ColumnarValue::values_to_arrays(&[string_value])?;
+            let string_view_array = as_string_view_array(&string_array_ref[0])?;
+
+            let mut builder = StringViewBuilder::with_capacity(string_view_array.len())
+                .with_deduplicate_strings();
+            for maybe_crs in string_view_array.iter() {
+                match maybe_crs {
+                    Some(crs_str) => builder.append_option(normalize_crs(crs_str)?),
+                    None => builder.append_null(),
+                }
+            }
+
+            Ok(builder.finish())
+        }
+    }
+}
+
+/// Validate a CRS string
+///
+/// If an engine is provided, the engine will be used to validate the CRS.
+/// Otherwise, no additional validation is performed (basic deserialization
+/// checks are handled by the cache structs).
+fn validate_crs(crs: &str, maybe_engine: Option<&Arc<dyn CrsEngine + Send + Sync>>) -> Result<()> {
+    if let Some(engine) = maybe_engine {
+        engine
+            .as_ref()
+            .get_transform_crs_to_crs(crs, crs, None, "")
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::StructArray;
+    use datafusion_common::ScalarValue;
+    use datafusion_expr::ScalarUDF;
+    use sedona_raster::array::RasterStructArray;
+    use sedona_raster::traits::RasterRef;
+    use sedona_schema::crs::deserialize_crs;
+    use sedona_schema::datatypes::RASTER;
+    use sedona_testing::raster_spec::assert_rasters_equal;
+    use sedona_testing::rasters::{generate_test_raster_spec, generate_test_rasters};
+    use sedona_testing::testers::ScalarUdfTester;
+
+    #[test]
+    fn normalize_crs_columnar_array_dedups_repeats_and_preserves_nulls() {
+        // The array branch: a column of many rasters carries only a few distinct
+        // CRS definitions, so they are deduplicated. A large PROJJSON repeated
+        // across rows, with a null and a short authority code interleaved.
+        const PROJJSON: &str = r#"{"type":"GeographicCRS","name":"NAD83","datum":{"type":"GeodeticReferenceFrame","name":"NAD83","ellipsoid":{"name":"GRS 1980","semi_major_axis":6378137,"inverse_flattening":298.257222101}},"coordinate_system":{"subtype":"ellipsoidal","axis":[{"name":"Geodetic latitude","abbreviation":"Lat","direction":"north","unit":"degree"},{"name":"Geodetic longitude","abbreviation":"Lon","direction":"east","unit":"degree"}]},"id":{"authority":"EPSG","code":4269}}"#;
+        let input = StringViewArray::from(vec![
+            Some(PROJJSON),
+            None,
+            Some(PROJJSON),
+            Some("EPSG:4326"),
+        ]);
+        let out = normalize_crs_columnar(&ColumnarValue::Array(Arc::new(input)), None).unwrap();
+
+        // Null placement matches the input row-for-row.
+        assert_eq!(out.len(), 4);
+        assert!(out.is_null(1), "the null row must be preserved");
+        // The PROJJSON is preserved in full (not collapsed to "EPSG:4269") and
+        // is identical across the two rows that carried it.
+        assert!(out.value(0).contains("GeographicCRS"));
+        assert_ne!(out.value(0), "EPSG:4269");
+        assert_eq!(out.value(0), out.value(2));
+        // EPSG:4326 is kept verbatim (<=12 bytes, inlined into the view).
+        assert_eq!(out.value(3), "EPSG:4326");
+
+        // Deduplication: the repeated PROJJSON lives in the shared data buffer
+        // exactly once, so total buffer bytes equal a single copy.
+        let buffer_bytes: usize = out.data_buffers().iter().map(|b| b.len()).sum();
+        assert_eq!(buffer_bytes, out.value(0).len());
+    }
+
+    #[test]
+    fn normalize_crs_columnar_scalar_normalizes_once() {
+        // The scalar branch: the definition is normalized a single time and
+        // returned as a one-element array; fan-out to the raster row count is
+        // broadcast_string_view's job.
+        const PROJJSON: &str = r#"{"type":"GeographicCRS","name":"NAD83","datum":{"type":"GeodeticReferenceFrame","name":"NAD83","ellipsoid":{"name":"GRS 1980","semi_major_axis":6378137,"inverse_flattening":298.257222101}},"coordinate_system":{"subtype":"ellipsoidal","axis":[{"name":"Geodetic latitude","abbreviation":"Lat","direction":"north","unit":"degree"},{"name":"Geodetic longitude","abbreviation":"Lon","direction":"east","unit":"degree"}]},"id":{"authority":"EPSG","code":4269}}"#;
+        let out = normalize_crs_columnar(
+            &ColumnarValue::Scalar(ScalarValue::Utf8(Some(PROJJSON.to_string()))),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        // Preserved in full, not collapsed to the embedded "EPSG:4269".
+        assert!(out.value(0).contains("GeographicCRS"));
+        assert_ne!(out.value(0), "EPSG:4269");
+
+        // "0" clears the CRS (maps to null).
+        let out = normalize_crs_columnar(
+            &ColumnarValue::Scalar(ScalarValue::Utf8(Some("0".to_string()))),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out.is_null(0));
+    }
+
+    #[test]
+    fn broadcast_string_view_stores_one_copy_across_many_rows() {
+        // The payoff for the scalar branch: many rasters, one CRS. Fanning the
+        // single definition out to a high row count stores its bytes exactly
+        // once in the shared view buffer (via try_append_value_n).
+        const PROJJSON: &str = r#"{"type":"GeographicCRS","name":"NAD83","datum":{"type":"GeodeticReferenceFrame","name":"NAD83","ellipsoid":{"name":"GRS 1980","semi_major_axis":6378137,"inverse_flattening":298.257222101}},"coordinate_system":{"subtype":"ellipsoidal","axis":[{"name":"Geodetic latitude","abbreviation":"Lat","direction":"north","unit":"degree"},{"name":"Geodetic longitude","abbreviation":"Lon","direction":"east","unit":"degree"}]},"id":{"authority":"EPSG","code":4269}}"#;
+        let scalar = StringViewArray::from(vec![Some(PROJJSON)]);
+        let out = broadcast_string_view(&scalar, 1000).unwrap();
+        let out = out.as_any().downcast_ref::<StringViewArray>().unwrap();
+
+        assert_eq!(out.len(), 1000);
+        assert_eq!(out.value(0), PROJJSON);
+        assert_eq!(out.value(999), PROJJSON);
+        let buffer_bytes: usize = out.data_buffers().iter().map(|b| b.len()).sum();
+        assert_eq!(buffer_bytes, PROJJSON.len());
+    }
+
+    #[test]
+    fn udf_metadata() {
+        let udf: ScalarUDF = rs_set_srid_udf().into();
+        assert_eq!(udf.name(), "rs_setsrid");
+
+        let udf: ScalarUDF = rs_set_crs_udf().into();
+        assert_eq!(udf.name(), "rs_setcrs");
+    }
+
+    #[test]
+    fn set_srid_array() {
+        let udf: ScalarUDF = rs_set_srid_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::UInt32)]);
+
+        tester.assert_return_type(RASTER);
+
+        // Generate rasters with OGC:CRS84 and set SRID to 3857
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let result = tester
+            .invoke_array_scalar(Arc::new(rasters), 3857u32)
+            .unwrap();
+
+        // Rows 0 and 2 have their CRS swapped to EPSG:3857 with all other
+        // fields preserved; the null raster at row 1 stays null.
+        assert_rasters_equal(
+            &result,
+            &[
+                Some(generate_test_raster_spec(0).crs(Some("EPSG:3857"))),
+                None,
+                Some(generate_test_raster_spec(2).crs(Some("EPSG:3857"))),
+            ],
+        );
+    }
+
+    #[test]
+    fn set_srid_4326_maps_to_ogc_crs84() {
+        let udf: ScalarUDF = rs_set_srid_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::UInt32)]);
+
+        let rasters = generate_test_rasters(1, None).unwrap();
+        let result = tester
+            .invoke_array_scalar(Arc::new(rasters), 4326u32)
+            .unwrap();
+
+        // SRID 4326 maps to the OGC:CRS84 authority code.
+        assert_rasters_equal(
+            &result,
+            &[Some(generate_test_raster_spec(0).crs(Some("OGC:CRS84")))],
+        );
+    }
+
+    #[test]
+    fn set_srid_zero_clears_crs() {
+        let udf: ScalarUDF = rs_set_srid_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::UInt32)]);
+
+        let rasters = generate_test_rasters(1, None).unwrap();
+        let result = tester.invoke_array_scalar(Arc::new(rasters), 0u32).unwrap();
+
+        // SRID 0 clears the CRS (maps to null) while preserving the raster.
+        assert_rasters_equal(&result, &[Some(generate_test_raster_spec(0).crs(None))]);
+    }
+
+    #[test]
+    fn set_crs_array() {
+        let udf: ScalarUDF = rs_set_crs_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Utf8)]);
+
+        tester.assert_return_type(RASTER);
+
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let result = tester
+            .invoke_array_scalar(Arc::new(rasters), "EPSG:3857")
+            .unwrap();
+
+        // Rows 0 and 2 have their CRS swapped to EPSG:3857 with all other
+        // fields preserved; the null raster at row 1 stays null.
+        assert_rasters_equal(
+            &result,
+            &[
+                Some(generate_test_raster_spec(0).crs(Some("EPSG:3857"))),
+                None,
+                Some(generate_test_raster_spec(2).crs(Some("EPSG:3857"))),
+            ],
+        );
+    }
+
+    #[test]
+    fn set_crs_epsg_4326_kept_verbatim() {
+        let udf: ScalarUDF = rs_set_crs_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Utf8)]);
+
+        let rasters = generate_test_rasters(1, None).unwrap();
+        let result = tester
+            .invoke_array_scalar(Arc::new(rasters), "EPSG:4326")
+            .unwrap();
+
+        let result_struct = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let raster_array = RasterStructArray::try_new(result_struct).unwrap();
+        let raster = raster_array.get(0).unwrap();
+        // EPSG:4326 is preserved as given (not folded to OGC:CRS84), but the two
+        // still deserialize to equal CRSes.
+        assert_eq!(raster.crs(), Some("EPSG:4326"));
+        assert_eq!(
+            deserialize_crs(raster.crs().unwrap()).unwrap(),
+            deserialize_crs("OGC:CRS84").unwrap()
+        );
+    }
+
+    #[test]
+    fn set_crs_zero_clears_crs() {
+        let udf: ScalarUDF = rs_set_crs_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Utf8)]);
+
+        let rasters = generate_test_rasters(1, None).unwrap();
+        let result = tester.invoke_array_scalar(Arc::new(rasters), "0").unwrap();
+
+        // CRS "0" clears the CRS (maps to null) while preserving the raster.
+        assert_rasters_equal(&result, &[Some(generate_test_raster_spec(0).crs(None))]);
+    }
+
+    #[test]
+    fn set_srid_preserves_metadata_and_bands() {
+        let udf: ScalarUDF = rs_set_srid_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::UInt32)]);
+
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let original_array = RasterStructArray::try_new(&rasters).unwrap();
+
+        let result = tester
+            .invoke_array_scalar(Arc::new(rasters.clone()), 3857u32)
+            .unwrap();
+        let result_struct = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let result_array = RasterStructArray::try_new(result_struct).unwrap();
+
+        // Verify non-null rasters have same metadata and band data
+        for i in [0, 2] {
+            let original = original_array.get(i).unwrap();
+            let modified = result_array.get(i).unwrap();
+
+            // Metadata preserved
+            assert_eq!(original.width().unwrap(), modified.width().unwrap());
+            assert_eq!(original.height().unwrap(), modified.height().unwrap());
+            assert_eq!(original.transform()[0], modified.transform()[0]);
+            assert_eq!(original.transform()[3], modified.transform()[3]);
+
+            // Band data preserved
+            assert_eq!(original.num_bands(), modified.num_bands());
+            for band_idx in 0..original.num_bands() {
+                let orig_band = original.band(band_idx).unwrap();
+                let mod_band = modified.band(band_idx).unwrap();
+                assert_eq!(
+                    orig_band.nd_buffer().unwrap().as_contiguous().unwrap(),
+                    mod_band.nd_buffer().unwrap().as_contiguous().unwrap()
+                );
+                assert_eq!(orig_band.data_type(), mod_band.data_type());
+            }
+
+            // CRS changed
+            assert_eq!(modified.crs(), Some("EPSG:3857"));
+            assert_ne!(original.crs(), modified.crs());
+        }
+    }
+
+    #[test]
+    fn set_srid_scalar_null_raster() {
+        let udf: ScalarUDF = rs_set_srid_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Int32)]);
+
+        let result = tester
+            .invoke_scalar_scalar(ScalarValue::Null, 3857)
+            .unwrap();
+        // ScalarValue::Null gets cast to a typed null raster struct by the tester,
+        // so the result is a null struct entry (not ScalarValue::Null).
+        match result {
+            ScalarValue::Struct(s) => assert!(s.is_null(0), "Expected null raster at index 0"),
+            other => panic!("Expected struct scalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_crs_scalar_null_raster() {
+        let udf: ScalarUDF = rs_set_crs_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Utf8)]);
+
+        let result = tester
+            .invoke_scalar_scalar(ScalarValue::Null, "EPSG:4326")
+            .unwrap();
+        // ScalarValue::Null gets cast to a typed null raster struct by the tester,
+        // so the result is a null struct entry (not ScalarValue::Null).
+        match result {
+            ScalarValue::Struct(s) => assert!(s.is_null(0), "Expected null raster at index 0"),
+            other => panic!("Expected struct scalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_srid_with_null_srid() {
+        let udf: ScalarUDF = rs_set_srid_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Int32)]);
+
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let null_srid = ScalarValue::Int32(None);
+
+        let result = tester
+            .invoke_array_scalar(Arc::new(rasters), null_srid)
+            .unwrap();
+        // A null SRID input nulls out every raster row.
+        assert_rasters_equal(&result, &[None, None, None]);
+    }
+
+    #[test]
+    fn set_crs_with_null_crs() {
+        let udf: ScalarUDF = rs_set_crs_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Utf8)]);
+
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let null_crs = ScalarValue::Utf8(None);
+
+        let result = tester
+            .invoke_array_scalar(Arc::new(rasters), null_crs)
+            .unwrap();
+        // A null CRS input nulls out every raster row.
+        assert_rasters_equal(&result, &[None, None, None]);
+    }
+
+    #[test]
+    fn set_srid_array_with_null_srid_per_row() {
+        let udf: ScalarUDF = rs_set_srid_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Int32)]);
+
+        // 3 rasters (null at index 1), SRIDs: [Some(3857), Some(4326), None]
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let srid_array: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![
+            Some(3857),
+            Some(4326),
+            None,
+        ]));
+
+        let result = tester
+            .invoke_array_array(Arc::new(rasters), srid_array)
+            .unwrap();
+
+        // Row 0: valid raster + valid SRID -> EPSG:3857.
+        // Row 1: null raster (from input) -> still null.
+        // Row 2: valid raster + null SRID -> null raster.
+        assert_rasters_equal(
+            &result,
+            &[
+                Some(generate_test_raster_spec(0).crs(Some("EPSG:3857"))),
+                None,
+                None,
+            ],
+        );
+    }
+
+    #[test]
+    fn set_crs_array_with_null_crs_per_row() {
+        let udf: ScalarUDF = rs_set_crs_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Utf8)]);
+
+        // 3 rasters (null at index 1), CRS strings: [Some("EPSG:3857"), Some("OGC:CRS84"), None]
+        let rasters = generate_test_rasters(3, Some(1)).unwrap();
+        let crs_array: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![
+            Some("EPSG:3857"),
+            Some("OGC:CRS84"),
+            None,
+        ]));
+
+        let result = tester
+            .invoke_array_array(Arc::new(rasters), crs_array)
+            .unwrap();
+
+        // Row 0: valid raster + valid CRS -> EPSG:3857.
+        // Row 1: null raster (from input) -> still null.
+        // Row 2: valid raster + null CRS -> null raster.
+        assert_rasters_equal(
+            &result,
+            &[
+                Some(generate_test_raster_spec(0).crs(Some("EPSG:3857"))),
+                None,
+                None,
+            ],
+        );
+    }
+}

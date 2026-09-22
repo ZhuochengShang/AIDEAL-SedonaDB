@@ -1,0 +1,1171 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+import math
+import os
+import warnings
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, List, Tuple
+
+import geoarrow.pyarrow as ga
+import pyarrow as pa
+
+from sedonadb.raster_testing import (
+    RANDOM_GRID_BANDS,
+    RANDOM_GRID_HEIGHT,
+    RANDOM_GRID_WIDTH,
+)
+from sedonadb.utility import register_pyarrow_extension_types
+
+register_pyarrow_extension_types()
+
+if TYPE_CHECKING:
+    import pandas
+
+    import sedonadb
+
+
+def random_geometry(*args, **kwargs) -> "sedonadb.dataframe.DataFrame":
+    """
+    Generate a DataFrame with random geometries for testing purposes by
+    calling sd_random_geometry() on an isolated SedonaDB session.
+    """
+    import sedonadb
+
+    sd = sedonadb.connect()
+    return sd.funcs.table.sd_random_geometry(*args, **kwargs)
+
+
+def skip_if_not_exists(path: Path):
+    """Skip a test using pytest.skip() if path does not exist
+
+    If SEDONADB_PYTHON_NO_SKIP_TESTS is set, this function will never skip to
+    avoid accidentally skipping tests on CI.
+    """
+    if _env_no_skip():
+        return
+
+    if not path.exists():
+        import pytest
+
+        pytest.skip(
+            f"Test asset '{path}' not found. "
+            "Run submodules/download-assets.py to test with submodule assets"
+        )
+
+
+def _env_no_skip():
+    env_no_skip = os.environ.get("SEDONADB_PYTHON_NO_SKIP_TESTS", "false")
+    return env_no_skip in ("true", "1")
+
+
+class DBEngine:
+    """Engine-agnostic catalog and SQL engine
+
+    Represents a connection to an engine, abstracting the details of registering
+    a few common types of inputs and generating a few common types of outputs.
+    This is intended for general testing and benchmarking usage and should not
+    be used for anything other than that purpose. Notably, generated SQL is not
+    hardened against injection and table creators always drop any existing table
+    of that name.
+    """
+
+    def close(self):
+        """Close the connection - base implementation does nothing"""
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    @classmethod
+    def name(cls) -> str:
+        """This engine's name
+
+        A short string used to identify this engine in error messages and work
+        around differences in behaviour.
+        """
+        raise NotImplementedError()
+
+    @classmethod
+    def install_hint(cls) -> str:
+        """A short install hint printed when skipping tests due to failed construction"""
+        return ""
+
+    @classmethod
+    def create_or_skip(cls, *args, **kwargs) -> "DBEngine":
+        """Create this engine or call pytest.skip()
+
+        This is the constructor that should be used in tests to ensure that integration
+        style tests don't cause failure for contributors working on Python-only
+        behaviour.
+
+        If SEDONADB_PYTHON_NO_SKIP_TESTS is set, this function will never skip to
+        avoid accidentally skipping tests on CI.
+        """
+        import pytest
+
+        # Ensure we can force this to succeed (or fail in CI)
+        if _env_no_skip():
+            return cls(*args, **kwargs)
+
+        # By default, allow construction to fail (e.g., for contributors running
+        # Python tests for the first time
+        try:
+            return cls(*args, **kwargs)
+        except Exception as e:
+            pytest.skip(
+                f"Failed to create engine tester {cls.name()}: {e}\n{cls.install_hint()}"
+            )
+
+    def geography_numeric_epsilon(self) -> float:
+        """Relative numeric_epsilon to use when comparing results to the SedonaDB value"""
+        return 1e-15
+
+    def val_or_null(self, arg: Any) -> str:
+        """Format SQL expression for a value or NULL"""
+        return val_or_null(arg)
+
+    def assert_query_result(self, query: str, expected, **kwargs) -> "DBEngine":
+        """Assert a SQL query result matches an expected target
+
+        A wrapper around execute_and_collect() and assert_result() that captures
+        the most common usage of the DBEngine.
+        """
+        result = self.execute_and_collect(query)
+        return self.assert_result(result, expected, **kwargs)
+
+    def create_view_parquet(self, name, paths) -> "DBEngine":
+        """Create a named view of Parquet files without scanning them
+
+        This is usually the best option for a benchmark if both engines support
+        pushing down a spatial filter into the Parquet files in question. This
+        is not supported by the PostGIS engine.
+        """
+        raise NotImplementedError()
+
+    def create_table_parquet(self, name, paths) -> "DBEngine":
+        """Scan one or more Parquet files and bring them an the engine's native table format
+
+        This is needed for engines that can't lazily scan Parquet (e.g., PostGIS) or engines
+        that have an optimized internal format (e.g., DuckDB). The ability of engines to
+        push down a scan into their own table format is variable.
+        """
+        raise NotImplementedError()
+
+    def create_table_pandas(self, name, obj) -> "DBEngine":
+        """Copy a GeoPandas or Pandas table into an engine's native table format"""
+        if hasattr(obj, "to_arrow"):
+            self.create_table_arrow(name, obj.to_arrow())
+        else:
+            self.create_table_arrow(name, obj)
+        return self
+
+    def create_table_arrow(self, name, obj) -> "DBEngine":
+        """Copy an Arrow readable into an engine's native table format"""
+        raise NotImplementedError()
+
+    def create_raster_view(self, name, path) -> "DBEngine":
+        """Register a one-row view `name` with a raster column `rast` read from
+        the GeoTIFF at `path`.
+
+        The single dialect-specific shim in the raster parity suite: each engine
+        ingests the file its own way (SedonaDB via `RS_FromPath`, Sedona Spark
+        via `RS_FromGeoTiff` over a `binaryFile` read), so the query under test
+        stays one shared SQL string that references `rast`.
+        """
+        raise NotImplementedError()
+
+    def create_random_raster_view(
+        self,
+        name,
+        path,
+        *,
+        dtype="uint8",
+        bands=RANDOM_GRID_BANDS,
+        height=RANDOM_GRID_HEIGHT,
+        width=RANDOM_GRID_WIDTH,
+        bbox=None,
+        gdal_transform=None,
+        nodata=None,
+        plants=None,
+    ) -> "DBEngine":
+        """Write a random GeoTIFF at `path` and register it as view `name`
+        (see `create_raster_view`).
+
+        The raster is exactly `DecodedRaster.random(...)` with the same
+        arguments, so a test can anchor with that constructor and the fixture
+        cannot drift from the expectation. The grid defaults to
+        `RANDOM_GRID_BBOX` on the 7x6 grid (2x3 pixels; override with `bbox`
+        or, for grids a bbox cannot express, a raw GDAL `gdal_transform` —
+        at most one). It is small and north-up/CRS-less so nothing reprojects
+        and results stay bit-comparable across engines, and the pixels are
+        seeded, so registering the same `path` on several engines rewrites
+        identical bytes and every engine sees the same raster.
+        """
+        from sedonadb.raster_testing import DecodedRaster
+
+        DecodedRaster.random(
+            dtype,
+            bands=bands,
+            height=height,
+            width=width,
+            bbox=bbox,
+            gdal_transform=gdal_transform,
+            nodata=nodata,
+            plants=plants,
+        ).write_geotiff(path)
+        return self.create_raster_view(name, path)
+
+    def decode_raster_result(self, sql):
+        """Run `sql` (which selects a single raster column) and decode the result
+        raster to a `sedonadb.raster_testing.DecodedRaster` — pixels, geotransform,
+        and per-band nodata — for cross-engine comparison. `None` if the raster is
+        NULL. Each engine decodes its own way (SedonaDB reads the native raster
+        column; Sedona Spark transports it out as GeoTIFF bytes).
+        """
+        raise NotImplementedError()
+
+    def result_has_raster(self, sql) -> bool:
+        """Whether `sql` produces a raster column on this engine.
+
+        Answered from the engine's lazy result schema — nothing executes.
+        This is what lets `compare` pick between the tuple comparison and the
+        decoded-raster comparison without assuming a particular engine as the
+        subject.
+        """
+        raise NotImplementedError()
+
+    def execute_and_collect(self, query):
+        """Execute a query and collect results to the driver
+
+        The output type here is engine-specific (use other methods to resolve the result
+        into concrete output formats). Current engines typically collect results as
+        Arrow; however, result_to_table() is required to guarantee that geometry results
+        are encoded as GeoArrow.
+
+        This is typically the execution step that should be benchmarked (although
+        the end-to-end time that includes data loading can also be a useful number for
+        some result types)
+        """
+        raise NotImplementedError()
+
+    def result_to_table(self, result) -> pa.Table:
+        """Convert a query result into a PyArrow Table"""
+        return pa.table(result)
+
+    def result_to_pandas(self, result) -> "pandas.DataFrame":
+        """Convert a query result into a pandas.DataFrame or geopandas.GeoDataFrame"""
+        import geopandas
+
+        tab = self.result_to_table(result)
+        geometry_cols = _geometry_columns(tab.schema)
+        if geometry_cols:
+            return geopandas.GeoDataFrame.from_arrow(tab)
+        else:
+            return tab.to_pandas()
+
+    def result_to_tuples(
+        self, result, *, wkt_precision=None, **kwargs
+    ) -> List[Tuple[str]]:
+        """Convert a query result into row tuples
+
+        This option strips away fine-grained type information but is helpful for
+        generally asserting a query result or verifying results between engines
+        that have (e.g.) differing integer handling.
+
+        Geometry columns are rendered as WKT strings. List columns (e.g. the
+        `List<Double>` returned by `RS_Values`) can't be cast to string, so they
+        pass through as Python lists and are compared by value — assert them with
+        an expected cell that is itself a list, e.g. ``[([1.0, None],)]``.
+        """
+        tab = self.result_to_table(result)
+        columns = []
+        for col in tab.columns:
+            # isinstance() does not always work with pyarrow in pytest
+            if _type_is_geoarrow(col.type):
+                columns.append(ga.format_wkt(col, precision=wkt_precision).to_pylist())
+            elif pa.types.is_list(col.type) or pa.types.is_large_list(col.type):
+                columns.append(col.to_pylist())
+            else:
+                columns.append(col.cast(pa.string()).to_pylist())
+
+        return list(zip(*columns))
+
+    def assert_result(self, result, expected, **kwargs) -> "DBEngine":
+        """Assert a result against an expected target
+
+        Supported expected targets include:
+
+        - A pyarrow.Table (compared using ==)
+        - A geopandas.GeoDataFrame (compared using geopandas.testing)
+        - A pandas.DataFrame (for non-spatial results; compared using pandas.testing)
+        - A list of tuples where all values have been converted to strings. For
+          geometry results, these strings are converted to WKT using geoarrow.pyarrow
+          (which ensures a consistent WKT output format).
+        - A tuple of strings as the string output of a single row
+        - A string as the string output of a single column of a single row
+        - A bool for a single boolean value
+        - An int or float for single numeric values (optionally with a numeric_epsilon)
+        - bytes for single binary values
+
+        Using Arrow table equality is the most strict (ensures exact type equality and
+        byte-for-byte value equality); however, string output is most useful for checking
+        logical value quality among engines. GeoPandas/Pandas expected targets generate
+        the most useful assertion failures and are probably the best option for general
+        usage.
+        """
+        import geopandas.testing
+        import pandas
+
+        if isinstance(expected, pa.Table):
+            result_arrow = self.result_to_table(result)
+            if result_arrow.schema != expected.schema:
+                raise AssertionError(
+                    f"Expected schema:\n  {expected.schema}\nGot:\n  {result_arrow.schema}"
+                )
+
+            if result_arrow.columns != expected.columns:
+                raise AssertionError(f"Expected:\n  {expected}\nGot:\n  {result_arrow}")
+
+            # It is probably a bug in geoarrow.types.type_parrow that CRS mismatches
+            # are still considered "equal" by the == operator
+            geometry_cols = _geometry_columns(result_arrow.schema)
+            expected_geometry_cols = _geometry_columns(expected.schema)
+            assert len(geometry_cols) == len(expected_geometry_cols)
+            for item, expected_item in zip(
+                geometry_cols.items(), expected_geometry_cols.items()
+            ):
+                assert item[0] == expected_item[0]
+
+                if item[1].edge_type != expected_item[1].edge_type:
+                    raise AssertionError(
+                        f"Edge type mismatch for column '{item[0]}': "
+                        f"Expected {expected_item[1].edge_type}, got {item[1].edge_type}"
+                    )
+
+                if not _crs_equal(item[1].crs, expected_item[1].crs):
+                    raise AssertionError(
+                        f"CRS mismatch for column '{item[0]}': "
+                        f"Expected {expected_item[1].crs}, got {item[1].crs}"
+                    )
+
+        elif isinstance(expected, geopandas.GeoDataFrame):
+            result_pandas = self.result_to_pandas(result)
+            geopandas.testing.assert_geodataframe_equal(
+                result_pandas, expected, **kwargs
+            )
+        elif isinstance(expected, pandas.DataFrame):
+            result_pandas = self.result_to_pandas(result)
+            pandas.testing.assert_frame_equal(result_pandas, expected, **kwargs)
+        elif isinstance(expected, list):
+            result_tuples = self.result_to_tuples(result, **kwargs)
+            if result_tuples != expected:
+                raise AssertionError(
+                    f"Expected:\n  {expected}\nGot:\n  {result_tuples}"
+                )
+        elif isinstance(expected, tuple):
+            self.assert_result(result, [expected], **kwargs)
+        elif isinstance(expected, str):
+            self.assert_result(result, [(expected,)], **kwargs)
+        elif isinstance(expected, bool):
+            self.assert_result(result, [(str(expected).lower(),)], **kwargs)
+        elif isinstance(expected, (int, float, bytes)):
+            result_df = self.result_to_pandas(result)
+            assert result_df.shape == (1, 1)
+            result_value = result_df.iloc[0, 0]
+            eps = kwargs.get("numeric_epsilon", None)
+            if eps is not None:
+                assert isinstance(expected, (int, float)), (
+                    f"numeric_epsilon is only supported for int or float, not {type(expected).__name__}"
+                )
+                assert math.isclose(result_value, expected, rel_tol=eps), (
+                    f"Expected {expected}, got {result_value}"
+                )
+            else:
+                assert result_value == expected, (
+                    f"Expected {expected}, got {result_value}"
+                )
+        elif expected is None:
+            self.assert_result(result, [(None,)], **kwargs)
+        else:
+            raise TypeError(
+                f"Can't assert result equality against {type(expected).__name__}"
+            )
+
+        return self
+
+
+class SedonaDB(DBEngine):
+    """A SedonaDB implementation of the DBEngine using the Python bindings"""
+
+    def __init__(self):
+        import sedonadb
+
+        self.con = sedonadb.connect()
+
+    @classmethod
+    def name(cls):
+        return "sedonadb"
+
+    @classmethod
+    def create_or_skip(cls, *args, **kwargs):
+        # Don't allow this to fail with a skip
+        return cls(*args, **kwargs)
+
+    def val_or_null(self, arg):
+        if isinstance(arg, bytes):
+            return f"X'{arg.hex()}'"
+        else:
+            return super().val_or_null(arg)
+
+    def create_table_parquet(self, name, paths) -> "SedonaDB":
+        self.con.read_parquet(paths).to_memtable().to_view(name, overwrite=True)
+        return self
+
+    def create_view_parquet(self, name, paths) -> "SedonaDB":
+        self.con.read_parquet(paths).to_view(name, overwrite=True)
+        return self
+
+    def create_table_pandas(self, name, obj) -> "SedonaDB":
+        self.con.create_data_frame(obj).to_view(name, overwrite=True)
+        return self
+
+    def create_table_arrow(self, name, obj) -> "SedonaDB":
+        self.con.create_data_frame(obj).to_view(name, overwrite=True)
+        return self
+
+    def create_raster_view(self, name, path) -> "SedonaDB":
+        self.con.sql(f"SELECT RS_FromPath('{path}') AS rast").to_view(
+            name, overwrite=True
+        )
+        return self
+
+    def decode_raster_result(self, sql):
+        from sedonadb.raster_testing import decode_raster
+
+        # RS_FromPath yields an OutDb (lazy) raster, so materialize the result
+        # before reading its pixels; Sedona Spark's RS_FromGeoTiff loads eagerly,
+        # so this keeps the two engines comparing the same bytes.
+        loaded = f"SELECT RS_EnsureLoaded(c) AS c FROM ({sql}) AS sub(c)"
+        table = self.execute_and_collect(loaded)
+        return decode_raster(table.column(0)[0])
+
+    def result_has_raster(self, sql) -> bool:
+        schema = pa.schema(self.con.sql(sql).schema)
+        return any(
+            getattr(t, "extension_name", None) == "sedona.raster" for t in schema.types
+        )
+
+    def execute_and_collect(self, query) -> "sedonadb.dataframe.DataFrame":
+        # Use to_arrow_table() to maintain ordering of the input table
+        return self.con.sql(query).to_arrow_table()
+
+
+class SedonaDBSingleThread(SedonaDB):
+    """SedonaDB configured for single-threaded execution"""
+
+    def __init__(self):
+        super().__init__()
+        # Force single-threaded execution
+        self.con.sql("SET datafusion.execution.target_partitions TO 1")
+
+
+class DuckDB(DBEngine):
+    """A DuckDB implementation of the DBEngine using DuckDB Python"""
+
+    def __init__(self):
+        import duckdb
+
+        self.con = duckdb.connect()
+        self.con.install_extension("spatial")
+        self.con.load_extension("spatial")
+        needs_geoarrow_registration = self.con.sql(
+            "SELECT count(*) > 0 FROM duckdb_functions() "
+            "WHERE function_name = 'register_geoarrow_extensions'"
+        ).fetchone()[0]
+
+        if needs_geoarrow_registration:
+            self.con.sql("CALL register_geoarrow_extensions()")
+
+    @classmethod
+    def name(cls):
+        return "duckdb"
+
+    @classmethod
+    def install_hint(cls):
+        return "- Run `pip install duckdb` to install DuckDB for Python"
+
+    def create_view_parquet(self, name, paths) -> "DuckDB":
+        self.con.read_parquet(_paths(paths)).to_view(name, replace=True)
+        return self
+
+    def create_table_parquet(self, name, paths) -> "DuckDB":
+        import duckdb
+
+        # DuckDB is picky about dropping views or tables and here we really don't
+        # care, we just want the name to be unambiguously cleared
+        try:
+            self.con.sql(f"DROP TABLE IF EXISTS {name}")
+        except duckdb.CatalogException:
+            pass
+
+        try:
+            self.con.sql(f"DROP VIEW IF EXISTS {name}")
+        except duckdb.CatalogException:
+            pass
+
+        self.con.read_parquet(_paths(paths)).to_table(name)
+        return self
+
+    def create_table_arrow(self, name, obj) -> "DuckDB":
+        self.con.register(f"{name}_temp", obj)
+        self.con.sql(f"CREATE TABLE {name} AS SELECT * FROM {name}_temp")
+        self.con.unregister(f"{name}_temp")
+        return self
+
+    def execute_and_collect(self, query) -> pa.Table:
+        return self.con.execute(query).arrow().read_all()
+
+
+class DuckDBSingleThread(DuckDB):
+    """DuckDB configured for single-threaded execution"""
+
+    def __init__(self):
+        super().__init__()
+        self.con.sql("SET threads TO 1")
+
+
+class PostGIS(DBEngine):
+    """A PostGIS implementation of the DBEngine using ADBC
+
+    The default constructor uses the URI of the container provided in the source
+    repository's compose.yml; however, a custom URI can be provided as well to
+    connect to non-docker PostGIS.
+    """
+
+    def __init__(self, uri=None):
+        import adbc_driver_postgresql.dbapi
+
+        if uri is None:
+            uri = "postgresql://localhost:5432/postgres?user=postgres&password=password"
+        self.con = adbc_driver_postgresql.dbapi.connect(uri)
+
+    def close(self):
+        """Close the connection"""
+        if self.con:
+            self.con.close()
+
+    @classmethod
+    def name(cls):
+        return "postgis"
+
+    @classmethod
+    def install_hint(cls):
+        return (
+            "- Run `pip install adbc-driver-postgresql` to install the required driver\n"
+            "- Run `docker compose up postgis` to start a test PostGIS runtime"
+        )
+
+    # Use reduced precision when comparing geography to SedonaDB asserted results
+    # because PostGIS uses an ellispoidal model and SedonaDB and BigQuery use
+    # spherical ones
+    def geography_numeric_epsilon(self) -> float:
+        return 1e-2
+
+    def val_or_null(self, arg):
+        if isinstance(arg, bytes):
+            return f"'\\x{arg.hex()}'::bytea"
+        else:
+            return super().val_or_null(arg)
+
+    def create_table_parquet(self, name, paths) -> "PostGIS":
+        import json
+
+        import pyproj
+        from pyarrow.dataset import dataset
+
+        # Use dataset() so that we can consume >1 parquet files as a reader
+        ds = dataset(paths)
+        geometry_cols = None
+
+        # Allow GeoParquet here. We could also use SedonaDB's reader but that involves
+        # some circular logic when testing correctness. Here we do a simple inspection
+        # of the metadata (if it exists) to override an existing schema.
+        # Note that there can still be geometry columns even if there is no metadata
+        # (e.g., when reading new Parquet files with the native type)
+        if b"geo" in ds.schema.metadata:
+            metadata = json.loads(ds.schema.metadata[b"geo"])
+            geometry_cols = {}
+            for col_name, col_spec in metadata["columns"].items():
+                if "crs" in col_spec and col_spec["crs"] is not None:
+                    col_crs = pyproj.CRS(col_spec["crs"])
+                elif "crs" in col_spec:
+                    col_crs = None
+                else:
+                    col_crs = pyproj.CRS("OGC:CRS84")
+
+                if "edges" in col_spec:
+                    edge_type = ga.EdgeType.create(col_spec["edges"])
+                else:
+                    edge_type = ga.EdgeType.PLANAR
+
+                geometry_cols[col_name] = (
+                    ga.wkb().with_crs(col_crs).with_edge_type(edge_type)
+                )
+
+        # Pass the RecordBatchReader from the dataset to create_table_arrow()
+        self.create_table_arrow(
+            name, ds.scanner().to_reader(), geometry_cols=geometry_cols
+        )
+
+        return self
+
+    def create_table_arrow(self, name, obj, *, geometry_cols=None) -> "PostGIS":
+        reader = pa.RecordBatchReader.from_stream(obj)
+
+        # If we weren't given the geometry columns, calculate them here.
+        if geometry_cols is None:
+            geometry_cols = _geometry_columns(reader.schema)
+
+        # Resolve the SRIDs from the spatial_ref_sys table
+        srids = {
+            n: self._insert_srid_if_needed(t.crs) for n, t in geometry_cols.items()
+        }
+
+        # Resolve the members of the SELECT ... statement we'll use to calculate
+        # the final version of this table. We need this to ensure our geometries
+        # or geographies have the correct types and SRIDs in the database table
+        constructor = {}
+        for col_name, type in geometry_cols.items():
+            from_wkb = (
+                "ST_GeomFromWKB"
+                if type.edge_type == ga.EdgeType.PLANAR
+                else "ST_GeogFromWKB"
+            )
+            expr = (
+                f'ST_SetSRID({from_wkb}("{col_name}"), {srids[col_name]}) AS {col_name}'
+            )
+            constructor[col_name] = expr
+
+        select_cols = [
+            f'"{nm}"' if nm not in constructor else constructor[nm]
+            for nm in reader.schema.names
+        ]
+        select_stmt = ", ".join(select_cols)
+
+        # Insert a temporary table using adbc_ingest, then calculate the final table
+        # with a CREATE TABLE AS SELECT statement.
+        with self.con.cursor() as cur:
+            cur.adbc_ingest(f"{name}_xtemp", reader, mode="replace")
+            cur.executescript(f"DROP TABLE IF EXISTS {name}")
+            cur.executescript(
+                f"CREATE TABLE {name} AS SELECT {select_stmt} FROM {name}_xtemp"
+            )
+            cur.executescript(f"DROP TABLE IF EXISTS {name}_xtemp")
+
+        return self
+
+    def execute_and_collect(self, query) -> pa.Table:
+        # Create and return whatever the driver gives us for a Table
+        with self.con.cursor() as cur:
+            cur.execute(query)
+            return cur.fetch_arrow_table()
+
+    def result_to_table(self, result: pa.Table) -> pa.Table:
+        # The "result" is whatever the driver gave us, which has the geometry encoded
+        # as an "opaque" extension type that passes on the type name. We can inspect
+        # this for "geometry" or "geography". We also need to inspect the EWKB payload
+        # (which is the Postgres wire representation of the geometry/geography type)
+        # to determine the output CRS.
+        cols = {}
+        for name, col in zip(result.schema.names, result.columns):
+            if isinstance(col.type, pa.OpaqueType) and col.type.type_name == "geometry":
+                col = col.cast(col.type.storage_type)
+                srid = _unique_srid_from_ewkb(col)
+                col_iso_wkb = ga.as_wkb(col, strict_iso_wkb=True)
+                cols[name] = ga.with_crs(
+                    ga.wkb().wrap_array(col_iso_wkb), self._srid_to_crs(srid)
+                )
+            elif (
+                isinstance(col.type, pa.OpaqueType)
+                and col.type.type_name == "geography"
+            ):
+                col = col.cast(col.type.storage_type)
+                srid = _unique_srid_from_ewkb(col)
+                col_iso_wkb = ga.as_wkb(col, strict_iso_wkb=True)
+                cols[name] = ga.with_crs(
+                    ga.wkb()
+                    .with_edge_type(ga.EdgeType.SPHERICAL)
+                    .wrap_array(col_iso_wkb),
+                    self._srid_to_crs(srid),
+                )
+            else:
+                cols[name] = col
+        return pa.table(cols)
+
+    def _srid_to_crs(self, srid):
+        """Query the spatial_ref_sys table for an SRID"""
+        if srid is None:
+            return None
+
+        with self.con.cursor() as cur:
+            cur.execute("SELECT srtext FROM spatial_ref_sys WHERE srid = $1", (srid,))
+            result = cur.fetchall()
+            if not result:
+                raise KeyError(f"srid {srid} not found in spatial_ref_sys")
+
+            import pyproj
+
+            return pyproj.CRS(result[0][0])
+
+    def _insert_srid_if_needed(self, crs):
+        """Add an SRID to the spatial_ref_sys table if needed"""
+        import pyproj
+
+        if crs is None:
+            return 0
+
+        crs = pyproj.CRS(crs)
+        col_srid = crs.to_authority("EPSG")
+        if col_srid is not None:
+            return col_srid[1]
+
+        col_srid = 900000 + hash(crs.to_wkt()) % 10000
+        with self.con.cursor() as cur, warnings.catch_warnings():
+            # Ignore the warning from PROJ about the proj4string
+            warnings.simplefilter("ignore")
+            cur.execute(
+                "SELECT count(*) FROM spatial_ref_sys WHERE srid = $1", (col_srid,)
+            )
+            if cur.fetchall() == [(0,)]:
+                cur.execute(
+                    """
+                    INSERT INTO spatial_ref_sys (srid, auth_name, auth_srid, srtext, proj4text)
+                    VALUES ($1, 'USER', $2, $3, $4);
+                    """,
+                    (col_srid, col_srid, crs.to_wkt(), crs.to_proj4()),
+                )
+                cur.fetchall()
+
+        return col_srid
+
+
+class PostGISSingleThread(PostGIS):
+    """PostGIS configured for single-threaded (no parallel workers) execution"""
+
+    def __init__(self, uri=None):
+        super().__init__(uri)
+        with self.con.cursor() as cur:
+            cur.execute("SET max_parallel_workers_per_gather TO 0")
+
+
+class BigQuery(DBEngine):
+    """A BigQuery implementation of the DBEngine using ADBC
+
+    Uses the ADBC BigQuery driver. Authentication uses Application Default
+    Credentials (ADC) by default — run ``gcloud auth application-default login``
+    once to set that up. Set the following environment variables to configure
+    the connection:
+
+    - SEDONADB_BIGQUERY_TEST_PROJECT_ID: GCP project identifier. Defaults to
+      "sedonadb-testing".
+    - SEDONADB_BIGQUERY_TEST_DATASET_ID: Dataset identifier. In general data is
+      not scanned for these tests because doing so would incur cost.
+    - SEDONADB_BIGQUERY_TEST_CREDENTIALS_FILE: (optional) Path to a service
+      account JSON key file. When omitted, ADC is used instead.
+
+    Unless modifying these tests, the cached results should allow these tests
+    to run without an active connection (and should allow tests to run locally
+    much faster as opening a connection to BigQuery is slow).
+    """
+
+    _CACHE_DIR: "Path | None" = None
+    _shared_cache: "ArrowSQLCache | None" = None
+
+    @classmethod
+    def set_cache_dir(cls, cache_dir: "Path | str") -> None:
+        """Set the directory containing bigquery_cache.yml.
+
+        Call this before any BigQuery instances are created to configure
+        where the cache file is located. This is typically called from a
+        conftest.py in the test directory.
+        """
+        cls._CACHE_DIR = Path(cache_dir)
+        cls._shared_cache = None  # Reset so next instance uses new path
+
+    def __init__(self, cache_path: "Path | None" = None):
+        if cache_path is None and BigQuery._CACHE_DIR is not None:
+            cache_path = BigQuery._CACHE_DIR / "bigquery_cache.yml"
+        self._cache_path = cache_path
+        if cache_path is not None or BigQuery._shared_cache is None:
+            BigQuery._shared_cache = ArrowSQLCache("bigquery", self._cache_path)
+        self._file_cache = BigQuery._shared_cache
+        self.con = None
+        self._con_attempted = False
+
+    def _ensure_con(self):
+        import adbc_driver_bigquery
+        import adbc_driver_bigquery.dbapi
+
+        if self.con is not None or self._con_attempted:
+            return
+        self._con_attempted = True
+
+        project_id = os.environ.get(
+            "SEDONADB_BIGQUERY_TEST_PROJECT_ID", "sedonadb-testing"
+        )
+        dataset_id = os.environ.get(
+            "SEDONADB_BIGQUERY_TEST_DATASET_ID", "sedonadb_test"
+        )
+        credentials_file = os.environ.get("SEDONADB_BIGQUERY_TEST_CREDENTIALS_FILE")
+
+        db_kwargs = {
+            adbc_driver_bigquery.DatabaseOptions.PROJECT_ID.value: project_id,
+            adbc_driver_bigquery.DatabaseOptions.DATASET_ID.value: dataset_id,
+        }
+
+        if credentials_file:
+            db_kwargs[adbc_driver_bigquery.DatabaseOptions.AUTH_TYPE.value] = (
+                adbc_driver_bigquery.DatabaseOptions.AUTH_VALUE_JSON_CREDENTIAL_FILE.value
+            )
+            db_kwargs[adbc_driver_bigquery.DatabaseOptions.AUTH_CREDENTIALS.value] = (
+                credentials_file
+            )
+
+        self.con = adbc_driver_bigquery.dbapi.connect(db_kwargs=db_kwargs)
+
+    def close(self):
+        """Close the connection and flush any new cache entries to disk"""
+        self._file_cache.flush()
+        if self.con:
+            self.con.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @classmethod
+    def name(cls):
+        return "bigquery"
+
+    @classmethod
+    def install_hint(cls):
+        return (
+            "- Run `pip install adbc-driver-bigquery` to install the required driver\n"
+            "- Run `gcloud auth application-default login` to authenticate\n"
+            "- Set SEDONADB_BIGQUERY_TEST_PROJECT_ID to a valid BigQuery project identifier"
+        )
+
+    # Use slightly reduced precision because BigQuery snaps vertices on input slightly
+    def geography_numeric_epsilon(self) -> float:
+        return 1e-14
+
+    def val_or_null(self, arg):
+        if isinstance(arg, bytes):
+            return f"FROM_HEX('{arg.hex()}')"
+        else:
+            return super().val_or_null(arg)
+
+    def create_table_parquet(self, name, paths) -> "BigQuery":
+        raise NotImplementedError("Create table from Parquet not implemented")
+
+    def create_table_arrow(self, name, obj, *, geometry_cols=None) -> "BigQuery":
+        raise NotImplementedError("Create table from Arrow not implemented")
+
+    def execute_and_collect(self, query) -> pa.Table:
+        cached = self._file_cache.get(query)
+        if cached is not None:
+            return cached
+
+        try:
+            self._ensure_con()
+        except Exception as e:
+            raise RuntimeError(
+                "Query not in cache and BigQuery connection unavailable:\n"
+                + BigQuery.install_hint()
+            ) from e
+
+        with self.con.cursor() as cur:
+            cur.execute(query)
+            result = cur.fetch_arrow_table()
+        self._file_cache.put(query, result)
+        return result
+
+    def result_to_table(self, result: pa.Table) -> pa.Table:
+        # BigQuery only has a GEOGRAPHY type (always WGS84 with spherical edges).
+        # The ADBC driver returns geography columns as WKT strings with
+        # Arrow extension metadata: ARROW:extension:name = 'google:sqlType:geography'.
+        cols = {}
+        for name, col in zip(result.schema.names, result.columns):
+            field = result.schema.field(name)
+            ext_name = (field.metadata or {}).get(b"ARROW:extension:name", b"")
+            if ext_name == b"google:sqlType:geography":
+                col_wkb = ga.as_wkb(col.cast(pa.string()))
+                cols[name] = ga.with_crs(
+                    ga.wkb().with_edge_type(ga.EdgeType.SPHERICAL).wrap_array(col_wkb),
+                    ga.OGC_CRS84,
+                )
+            else:
+                cols[name] = col
+
+        return pa.table(cols)
+
+
+class ArrowSQLCache:
+    """A YAML-file-backed cache for Arrow-based query results.
+
+    Each entry stores a pa.Table as base64-encoded Arrow IPC. Queries are
+    sorted alphabetically when written for stable git diffs. Results are
+    nested under ``results.<engine_name>`` in the YAML output.
+
+    Leading comment lines (e.g., a license header) are preserved across
+    rewrites.
+    """
+
+    def __init__(self, engine_name: str, path: Path):
+        self._engine_name = engine_name
+        self._path = path
+        self._header_lines = []
+        self._entries: dict = {}
+        self._dirty = False
+        if self._path.exists():
+            self._load()
+
+    def _load(self):
+        import yaml
+
+        with open(self._path) as f:
+            lines = f.readlines()
+
+        # Split leading comment lines from the YAML body
+        body_start = 0
+        for i, line in enumerate(lines):
+            if line.startswith("#") or line.strip() == "":
+                body_start = i + 1
+            else:
+                break
+        self._header_lines = lines[:body_start]
+
+        body = "".join(lines[body_start:])
+        doc = yaml.safe_load(body) if body.strip() else {}
+        if doc and "results" in doc:
+            self._entries = doc["results"].get(self._engine_name, {})
+        else:
+            self._entries = doc or {}
+
+    def get(self, query: str) -> "pa.Table | None":
+        entry = self._entries.get(query)
+        if entry is None:
+            return None
+        import base64
+
+        buf = base64.b64decode(entry)
+        return pa.ipc.open_stream(buf).read_all()
+
+    def put(self, query: str, table: pa.Table):
+        import base64
+
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, table.schema) as writer:
+            writer.write_table(table)
+        self._entries[query] = base64.b64encode(sink.getvalue().to_pybytes()).decode()
+        self._dirty = True
+
+    def flush(self):
+        if not self._dirty:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        doc = {"results": {self._engine_name: self._entries}}
+        with open(self._path, "w") as f:
+            import yaml
+
+            f.writelines(self._header_lines)
+            yaml.dump(doc, f, default_flow_style=False, sort_keys=True)
+        self._dirty = False
+
+
+def compare(sql, *engines, expected=None):
+    """Assert every engine returns the same result for one shared SQL string.
+
+    The cross-engine parity assertion. The first engine is the subject — its
+    result is the "got" side of every failure message — and each further
+    engine's result is an expected side, so with more than two engines the
+    subject is checked against every reference (which, by transitivity, means
+    they all agree).
+
+    Table-shaped results are compared in `result_to_tuples` form, the
+    representation built for verifying results between engines: Arrow
+    stringifies values identically on every side, NULL stays `None`, and NaN
+    becomes the string ``"nan"`` (bare float equality would lose it). A result
+    with a raster column is instead decoded on every engine
+    (`decode_raster_result`) and compared with
+    `sedonadb.raster_testing.assert_decoded_equal`; every engine agreeing the
+    raster is NULL also counts as agreement. The dispatch asks the subject's
+    `result_has_raster`, answered from its lazy result schema, so any engine
+    that implements the raster hooks can be the subject.
+
+    `expected` (optional) anchors the comparison to a known value: the subject
+    is asserted against it first, and the references are then anchored
+    transitively. Engines agreeing with each other is not proof that any of
+    them is right — every engine returning the same wrong thing (say, a no-op
+    where an operation was meant to happen) passes the parity claim — so pass
+    an anchor whenever the expected result is easy to state. For table results
+    `expected` is anything `assert_result` accepts (a float, a list of
+    `result_to_tuples` rows, a pandas frame, ...); for raster results it is a
+    `sedonadb.raster_testing.DecodedRaster`.
+    """
+    if len(engines) < 2:
+        raise ValueError("compare() needs at least two engines")
+    subject, references = engines[0], engines[1:]
+
+    if subject.result_has_raster(sql):
+        from sedonadb.raster_testing import assert_decoded_equal
+
+        got = subject.decode_raster_result(sql)
+        if expected is not None:
+            assert_decoded_equal(got, expected, context=sql)
+        for reference in references:
+            reference_raster = reference.decode_raster_result(sql)
+            if got is None and reference_raster is None:
+                continue
+            assert_decoded_equal(got, reference_raster, context=sql)
+    else:
+        result = subject.execute_and_collect(sql)
+        if expected is not None:
+            subject.assert_result(result, expected)
+        for reference in references:
+            reference_tuples = reference.result_to_tuples(
+                reference.execute_and_collect(sql)
+            )
+            subject.assert_result(result, reference_tuples)
+
+
+def geom_or_null(arg, srid=None):
+    """Format SQL expression for a geometry object or NULL"""
+    if arg is None:
+        return "NULL"
+
+    if srid is None:
+        return f"ST_GeomFromText('{arg}')"
+    else:
+        return f"ST_GeomFromEWKT('SRID={srid};{arg}')"
+
+
+def geog_or_null(arg):
+    """Format SQL expression for a geography object or NULL"""
+    if arg is None:
+        return "NULL"
+    return f"ST_GeogFromText('{arg}')"
+
+
+def val_or_null(arg):
+    """Format SQL expression for a value or NULL
+
+    Use an engine-specific method when formatting bytes as there is no
+    engine-agnostic way to to represent bytes as a SQL literal.
+
+    This is not secure (i.e., does not prevent SQL injection of any kind)
+    and should only be used for testing.
+    """
+    if arg is None:
+        return "NULL"
+    elif isinstance(arg, bytes):
+        raise NotImplementedError("Use eng.val_or_null() to format bytes to SQL")
+    else:
+        return arg
+
+
+def _geometry_columns(schema):
+    cols = {}
+    for name, type in zip(schema.names, schema.types):
+        if _type_is_geoarrow(type):
+            cols[name] = type
+    return cols
+
+
+def _type_is_geoarrow(type):
+    # isinstance() does not always work with pyarrow in pytest
+    return hasattr(type, "extension_name") and type.extension_name.startswith(
+        "geoarrow"
+    )
+
+
+def _crs_equal(actual, expected):
+    import pyproj
+
+    if actual is None and expected is not None:
+        return False
+    elif actual is not None and expected is None:
+        return False
+    elif actual is None and expected is None:
+        return True
+    else:
+        return pyproj.CRS(actual) == pyproj.CRS(expected)
+
+
+def _paths(paths):
+    if isinstance(paths, list):
+        return [str(p) for p in paths]
+    else:
+        return str(paths)
+
+
+# Original source:
+# https://github.com/apache/sedona/blob/547faa30cd1b3a748232fd1da37123a8d25137ce/python/sedona/spark/geoarrow/geoarrow.py#L190-L225
+def _unique_srid_from_ewkb(obj):
+    import pyarrow.compute as pc
+
+    if len(obj) == 0:
+        return None
+
+    # Output shouldn't have mixed endian here
+    endian = pc.binary_slice(obj, 0, 1).unique()
+    if len(endian) != 1:
+        raise ValueError("Can't infer column-level CRS from mixed-endian EWKB")
+
+    # WKB Z high byte is 0x80
+    # WKB M high byte is is 0x40
+    # EWKB SRID high byte is 0x20
+    # High bytes where the SRID is set would be
+    # [0x20, 0x20 | 0x40, 0x20 | 0x80, 0x20 | 0x40 | 0x80]
+    # == [0x20, 0x60, 0xa0, 0xe0]
+    is_little_endian = endian[0].as_py() == b"\x01"
+    high_byte = (
+        pc.binary_slice(obj, 4, 5) if is_little_endian else pc.binary_slice(obj, 1, 2)
+    )
+    has_srid = pc.is_in(high_byte, pa.array([b"\x20", b"\x60", b"\xa0", b"\xe0"]))
+    unique_srids = (
+        pc.if_else(has_srid, pc.binary_slice(obj, 5, 9), None).unique().drop_null()
+    )
+    if len(unique_srids) == 0:
+        return None
+
+    if len(unique_srids) > 1:
+        raise ValueError(
+            f"Can't infer column-level CRS from output with multiple SRIDs: {unique_srids}"
+        )
+
+    srid_bytes = unique_srids[0].as_py()
+    endian = "little" if is_little_endian else "big"
+    epsg_code = int.from_bytes(srid_bytes, endian)
+
+    return epsg_code

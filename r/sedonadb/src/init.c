@@ -1,0 +1,489 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+// clang-format sorts includes unless SortIncludes: Never. However, the ordering
+// does matter here. So, we need to disable clang-format for safety.
+
+// clang-format off
+#include <stdint.h>
+#include <Rinternals.h>
+#include <R_ext/Parse.h>
+// clang-format on
+
+#include "rust/api.h"
+
+static uintptr_t TAGGED_POINTER_MASK = (uintptr_t)1;
+
+SEXP handle_result(SEXP res_) {
+  uintptr_t res = (uintptr_t)res_;
+
+  // An error is indicated by tag.
+  if ((res & TAGGED_POINTER_MASK) == 1) {
+    // Remove tag
+    SEXP res_aligned = (SEXP)(res & ~TAGGED_POINTER_MASK);
+
+    // Currently, there are two types of error cases:
+    //
+    //   1. Error from Rust code
+    //   2. Error from R's C API, which is caught by R_UnwindProtect()
+    //
+    if (TYPEOF(res_aligned) == CHARSXP) {
+      // In case 1, the result is an error message that can be passed to
+      // Rf_errorcall() directly.
+      Rf_errorcall(R_NilValue, "%s", CHAR(res_aligned));
+    } else {
+      // In case 2, the result is the token to restart the
+      // cleanup process on R's side.
+      R_ContinueUnwind(res_aligned);
+    }
+  }
+
+  return (SEXP)res;
+}
+
+SEXP savvy_apply_crses_to_sf_stream__impl(SEXP c_arg__stream_in_xptr,
+                                          SEXP c_arg__geometry_column_names,
+                                          SEXP c_arg__geometry_column_crses,
+                                          SEXP c_arg__stream_out_xptr) {
+  SEXP res = savvy_apply_crses_to_sf_stream__ffi(
+      c_arg__stream_in_xptr, c_arg__geometry_column_names,
+      c_arg__geometry_column_crses, c_arg__stream_out_xptr);
+  return handle_result(res);
+}
+
+SEXP savvy_configure_proj_shared__impl(SEXP c_arg__shared_library_path,
+                                       SEXP c_arg__database_path,
+                                       SEXP c_arg__search_path) {
+  SEXP res = savvy_configure_proj_shared__ffi(
+      c_arg__shared_library_path, c_arg__database_path, c_arg__search_path);
+  return handle_result(res);
+}
+
+SEXP savvy_init_r_runtime__impl(DllInfo *c_arg___dll_info) {
+  SEXP res = savvy_init_r_runtime__ffi(c_arg___dll_info);
+  return handle_result(res);
+}
+
+SEXP savvy_init_r_runtime_interrupts__impl(SEXP c_arg__interrupts_call,
+                                           SEXP c_arg__pkg_env) {
+  SEXP res = savvy_init_r_runtime_interrupts__ffi(c_arg__interrupts_call,
+                                                  c_arg__pkg_env);
+  return handle_result(res);
+}
+
+SEXP savvy_sedonadb_adbc_init_func__impl(void) {
+  SEXP res = savvy_sedonadb_adbc_init_func__ffi();
+  return handle_result(res);
+}
+
+SEXP savvy_InternalContext_data_frame_from_array_stream__impl(
+    SEXP self__, SEXP c_arg__stream_xptr, SEXP c_arg__collect_now) {
+  SEXP res = savvy_InternalContext_data_frame_from_array_stream__ffi(
+      self__, c_arg__stream_xptr, c_arg__collect_now);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalContext_data_frame_from_table_provider__impl(
+    SEXP self__, SEXP c_arg__provider_xptr) {
+  SEXP res = savvy_InternalContext_data_frame_from_table_provider__ffi(
+      self__, c_arg__provider_xptr);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalContext_deregister_table__impl(SEXP self__,
+                                                  SEXP c_arg__table_ref) {
+  SEXP res =
+      savvy_InternalContext_deregister_table__ffi(self__, c_arg__table_ref);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalContext_list_functions__impl(SEXP self__) {
+  SEXP res = savvy_InternalContext_list_functions__ffi(self__);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalContext_new__impl(SEXP c_arg__option_keys,
+                                     SEXP c_arg__option_values) {
+  SEXP res =
+      savvy_InternalContext_new__ffi(c_arg__option_keys, c_arg__option_values);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalContext_read_parquet__impl(SEXP self__, SEXP c_arg__paths) {
+  SEXP res = savvy_InternalContext_read_parquet__ffi(self__, c_arg__paths);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalContext_register_scalar_udf__impl(
+    SEXP self__, SEXP c_arg__scalar_udf_xptr) {
+  SEXP res = savvy_InternalContext_register_scalar_udf__ffi(
+      self__, c_arg__scalar_udf_xptr);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalContext_scalar_udf_xptr__impl(SEXP self__,
+                                                 SEXP c_arg__name) {
+  SEXP res = savvy_InternalContext_scalar_udf_xptr__ffi(self__, c_arg__name);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalContext_sql__impl(SEXP self__, SEXP c_arg__query) {
+  SEXP res = savvy_InternalContext_sql__ffi(self__, c_arg__query);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalContext_view__impl(SEXP self__, SEXP c_arg__table_ref) {
+  SEXP res = savvy_InternalContext_view__ffi(self__, c_arg__table_ref);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_aggregate__impl(SEXP self__,
+                                             SEXP c_arg__group_by_exprs_sexp,
+                                             SEXP c_arg__exprs_sexp) {
+  SEXP res = savvy_InternalDataFrame_aggregate__ffi(
+      self__, c_arg__group_by_exprs_sexp, c_arg__exprs_sexp);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_arrange__impl(SEXP self__, SEXP c_arg__exprs_sexp,
+                                           SEXP c_arg__is_descending_sexp) {
+  SEXP res = savvy_InternalDataFrame_arrange__ffi(self__, c_arg__exprs_sexp,
+                                                  c_arg__is_descending_sexp);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_collect__impl(SEXP self__, SEXP c_arg__out) {
+  SEXP res = savvy_InternalDataFrame_collect__ffi(self__, c_arg__out);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_compute__impl(SEXP self__, SEXP c_arg__ctx) {
+  SEXP res = savvy_InternalDataFrame_compute__ffi(self__, c_arg__ctx);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_count__impl(SEXP self__) {
+  SEXP res = savvy_InternalDataFrame_count__ffi(self__);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_filter__impl(SEXP self__, SEXP c_arg__exprs_sexp) {
+  SEXP res = savvy_InternalDataFrame_filter__ffi(self__, c_arg__exprs_sexp);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_join__impl(SEXP self__, SEXP c_arg__right,
+                                        SEXP c_arg__on_sexp,
+                                        SEXP c_arg__join_type_str,
+                                        SEXP c_arg__left_alias,
+                                        SEXP c_arg__right_alias) {
+  SEXP res = savvy_InternalDataFrame_join__ffi(
+      self__, c_arg__right, c_arg__on_sexp, c_arg__join_type_str,
+      c_arg__left_alias, c_arg__right_alias);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_limit__impl(SEXP self__, SEXP c_arg__n) {
+  SEXP res = savvy_InternalDataFrame_limit__ffi(self__, c_arg__n);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_primary_geometry_column_index__impl(SEXP self__) {
+  SEXP res = savvy_InternalDataFrame_primary_geometry_column_index__ffi(self__);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_select__impl(SEXP self__, SEXP c_arg__exprs_sexp) {
+  SEXP res = savvy_InternalDataFrame_select__ffi(self__, c_arg__exprs_sexp);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_select_indices__impl(SEXP self__,
+                                                  SEXP c_arg__names,
+                                                  SEXP c_arg__indices) {
+  SEXP res = savvy_InternalDataFrame_select_indices__ffi(self__, c_arg__names,
+                                                         c_arg__indices);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_show__impl(SEXP self__, SEXP c_arg__ctx,
+                                        SEXP c_arg__width_chars,
+                                        SEXP c_arg__ascii, SEXP c_arg__limit) {
+  SEXP res = savvy_InternalDataFrame_show__ffi(
+      self__, c_arg__ctx, c_arg__width_chars, c_arg__ascii, c_arg__limit);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_to_arrow_schema__impl(SEXP self__,
+                                                   SEXP c_arg__out) {
+  SEXP res = savvy_InternalDataFrame_to_arrow_schema__ffi(self__, c_arg__out);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_to_arrow_stream__impl(
+    SEXP self__, SEXP c_arg__out, SEXP c_arg__requested_schema_xptr) {
+  SEXP res = savvy_InternalDataFrame_to_arrow_stream__ffi(
+      self__, c_arg__out, c_arg__requested_schema_xptr);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_to_parquet__impl(
+    SEXP self__, SEXP c_arg__ctx, SEXP c_arg__path, SEXP c_arg__option_keys,
+    SEXP c_arg__option_values, SEXP c_arg__partition_by, SEXP c_arg__sort_by,
+    SEXP c_arg__single_file_output) {
+  SEXP res = savvy_InternalDataFrame_to_parquet__ffi(
+      self__, c_arg__ctx, c_arg__path, c_arg__option_keys, c_arg__option_values,
+      c_arg__partition_by, c_arg__sort_by, c_arg__single_file_output);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_to_provider__impl(SEXP self__, SEXP c_arg__ctx) {
+  SEXP res = savvy_InternalDataFrame_to_provider__ffi(self__, c_arg__ctx);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_to_view__impl(SEXP self__, SEXP c_arg__ctx,
+                                           SEXP c_arg__table_ref,
+                                           SEXP c_arg__overwrite) {
+  SEXP res = savvy_InternalDataFrame_to_view__ffi(
+      self__, c_arg__ctx, c_arg__table_ref, c_arg__overwrite);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalDataFrame_with_params__impl(SEXP self__,
+                                               SEXP c_arg__params_sexp) {
+  SEXP res =
+      savvy_InternalDataFrame_with_params__ffi(self__, c_arg__params_sexp);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExpr_alias__impl(SEXP self__, SEXP c_arg__name) {
+  SEXP res = savvy_SedonaDBExpr_alias__ffi(self__, c_arg__name);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExpr_cast__impl(SEXP self__, SEXP c_arg__schema_xptr) {
+  SEXP res = savvy_SedonaDBExpr_cast__ffi(self__, c_arg__schema_xptr);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExpr_debug_string__impl(SEXP self__) {
+  SEXP res = savvy_SedonaDBExpr_debug_string__ffi(self__);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExpr_display__impl(SEXP self__) {
+  SEXP res = savvy_SedonaDBExpr_display__ffi(self__);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExpr_is_not_null__impl(SEXP self__) {
+  SEXP res = savvy_SedonaDBExpr_is_not_null__ffi(self__);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExpr_is_null__impl(SEXP self__) {
+  SEXP res = savvy_SedonaDBExpr_is_null__ffi(self__);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExpr_negate__impl(SEXP self__) {
+  SEXP res = savvy_SedonaDBExpr_negate__ffi(self__);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExpr_not__impl(SEXP self__) {
+  SEXP res = savvy_SedonaDBExpr_not__ffi(self__);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExpr_parse_binary__impl(SEXP self__) {
+  SEXP res = savvy_SedonaDBExpr_parse_binary__ffi(self__);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExpr_qualified_name__impl(SEXP self__) {
+  SEXP res = savvy_SedonaDBExpr_qualified_name__ffi(self__);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExpr_variant_name__impl(SEXP self__) {
+  SEXP res = savvy_SedonaDBExpr_variant_name__ffi(self__);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExprFactory_aggregate_function__impl(SEXP self__,
+                                                        SEXP c_arg__name,
+                                                        SEXP c_arg__args,
+                                                        SEXP c_arg__na_rm,
+                                                        SEXP c_arg__distinct) {
+  SEXP res = savvy_SedonaDBExprFactory_aggregate_function__ffi(
+      self__, c_arg__name, c_arg__args, c_arg__na_rm, c_arg__distinct);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExprFactory_any_function__impl(SEXP self__, SEXP c_arg__name,
+                                                  SEXP c_arg__args,
+                                                  SEXP c_arg__na_rm) {
+  SEXP res = savvy_SedonaDBExprFactory_any_function__ffi(
+      self__, c_arg__name, c_arg__args, c_arg__na_rm);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExprFactory_binary__impl(SEXP self__, SEXP c_arg__op,
+                                            SEXP c_arg__lhs, SEXP c_arg__rhs) {
+  SEXP res = savvy_SedonaDBExprFactory_binary__ffi(self__, c_arg__op,
+                                                   c_arg__lhs, c_arg__rhs);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExprFactory_column__impl(SEXP self__, SEXP c_arg__name,
+                                            SEXP c_arg__qualifier) {
+  SEXP res = savvy_SedonaDBExprFactory_column__ffi(self__, c_arg__name,
+                                                   c_arg__qualifier);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExprFactory_literal__impl(SEXP c_arg__array_xptr,
+                                             SEXP c_arg__schema_xptr) {
+  SEXP res = savvy_SedonaDBExprFactory_literal__ffi(c_arg__array_xptr,
+                                                    c_arg__schema_xptr);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExprFactory_new__impl(SEXP c_arg__ctx) {
+  SEXP res = savvy_SedonaDBExprFactory_new__ffi(c_arg__ctx);
+  return handle_result(res);
+}
+
+SEXP savvy_SedonaDBExprFactory_scalar_function__impl(SEXP self__,
+                                                     SEXP c_arg__name,
+                                                     SEXP c_arg__args) {
+  SEXP res = savvy_SedonaDBExprFactory_scalar_function__ffi(self__, c_arg__name,
+                                                            c_arg__args);
+  return handle_result(res);
+}
+
+static const R_CallMethodDef CallEntries[] = {
+    {"savvy_apply_crses_to_sf_stream__impl",
+     (DL_FUNC)&savvy_apply_crses_to_sf_stream__impl, 4},
+    {"savvy_configure_proj_shared__impl",
+     (DL_FUNC)&savvy_configure_proj_shared__impl, 3},
+    {"savvy_init_r_runtime_interrupts__impl",
+     (DL_FUNC)&savvy_init_r_runtime_interrupts__impl, 2},
+    {"savvy_sedonadb_adbc_init_func__impl",
+     (DL_FUNC)&savvy_sedonadb_adbc_init_func__impl, 0},
+    {"savvy_InternalContext_data_frame_from_array_stream__impl",
+     (DL_FUNC)&savvy_InternalContext_data_frame_from_array_stream__impl, 3},
+    {"savvy_InternalContext_data_frame_from_table_provider__impl",
+     (DL_FUNC)&savvy_InternalContext_data_frame_from_table_provider__impl, 2},
+    {"savvy_InternalContext_deregister_table__impl",
+     (DL_FUNC)&savvy_InternalContext_deregister_table__impl, 2},
+    {"savvy_InternalContext_list_functions__impl",
+     (DL_FUNC)&savvy_InternalContext_list_functions__impl, 1},
+    {"savvy_InternalContext_new__impl",
+     (DL_FUNC)&savvy_InternalContext_new__impl, 2},
+    {"savvy_InternalContext_read_parquet__impl",
+     (DL_FUNC)&savvy_InternalContext_read_parquet__impl, 2},
+    {"savvy_InternalContext_register_scalar_udf__impl",
+     (DL_FUNC)&savvy_InternalContext_register_scalar_udf__impl, 2},
+    {"savvy_InternalContext_scalar_udf_xptr__impl",
+     (DL_FUNC)&savvy_InternalContext_scalar_udf_xptr__impl, 2},
+    {"savvy_InternalContext_sql__impl",
+     (DL_FUNC)&savvy_InternalContext_sql__impl, 2},
+    {"savvy_InternalContext_view__impl",
+     (DL_FUNC)&savvy_InternalContext_view__impl, 2},
+    {"savvy_InternalDataFrame_aggregate__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_aggregate__impl, 3},
+    {"savvy_InternalDataFrame_arrange__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_arrange__impl, 3},
+    {"savvy_InternalDataFrame_collect__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_collect__impl, 2},
+    {"savvy_InternalDataFrame_compute__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_compute__impl, 2},
+    {"savvy_InternalDataFrame_count__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_count__impl, 1},
+    {"savvy_InternalDataFrame_filter__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_filter__impl, 2},
+    {"savvy_InternalDataFrame_join__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_join__impl, 6},
+    {"savvy_InternalDataFrame_limit__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_limit__impl, 2},
+    {"savvy_InternalDataFrame_primary_geometry_column_index__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_primary_geometry_column_index__impl, 1},
+    {"savvy_InternalDataFrame_select__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_select__impl, 2},
+    {"savvy_InternalDataFrame_select_indices__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_select_indices__impl, 3},
+    {"savvy_InternalDataFrame_show__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_show__impl, 5},
+    {"savvy_InternalDataFrame_to_arrow_schema__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_to_arrow_schema__impl, 2},
+    {"savvy_InternalDataFrame_to_arrow_stream__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_to_arrow_stream__impl, 3},
+    {"savvy_InternalDataFrame_to_parquet__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_to_parquet__impl, 8},
+    {"savvy_InternalDataFrame_to_provider__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_to_provider__impl, 2},
+    {"savvy_InternalDataFrame_to_view__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_to_view__impl, 4},
+    {"savvy_InternalDataFrame_with_params__impl",
+     (DL_FUNC)&savvy_InternalDataFrame_with_params__impl, 2},
+    {"savvy_SedonaDBExpr_alias__impl", (DL_FUNC)&savvy_SedonaDBExpr_alias__impl,
+     2},
+    {"savvy_SedonaDBExpr_cast__impl", (DL_FUNC)&savvy_SedonaDBExpr_cast__impl,
+     2},
+    {"savvy_SedonaDBExpr_debug_string__impl",
+     (DL_FUNC)&savvy_SedonaDBExpr_debug_string__impl, 1},
+    {"savvy_SedonaDBExpr_display__impl",
+     (DL_FUNC)&savvy_SedonaDBExpr_display__impl, 1},
+    {"savvy_SedonaDBExpr_is_not_null__impl",
+     (DL_FUNC)&savvy_SedonaDBExpr_is_not_null__impl, 1},
+    {"savvy_SedonaDBExpr_is_null__impl",
+     (DL_FUNC)&savvy_SedonaDBExpr_is_null__impl, 1},
+    {"savvy_SedonaDBExpr_negate__impl",
+     (DL_FUNC)&savvy_SedonaDBExpr_negate__impl, 1},
+    {"savvy_SedonaDBExpr_not__impl", (DL_FUNC)&savvy_SedonaDBExpr_not__impl, 1},
+    {"savvy_SedonaDBExpr_parse_binary__impl",
+     (DL_FUNC)&savvy_SedonaDBExpr_parse_binary__impl, 1},
+    {"savvy_SedonaDBExpr_qualified_name__impl",
+     (DL_FUNC)&savvy_SedonaDBExpr_qualified_name__impl, 1},
+    {"savvy_SedonaDBExpr_variant_name__impl",
+     (DL_FUNC)&savvy_SedonaDBExpr_variant_name__impl, 1},
+    {"savvy_SedonaDBExprFactory_aggregate_function__impl",
+     (DL_FUNC)&savvy_SedonaDBExprFactory_aggregate_function__impl, 5},
+    {"savvy_SedonaDBExprFactory_any_function__impl",
+     (DL_FUNC)&savvy_SedonaDBExprFactory_any_function__impl, 4},
+    {"savvy_SedonaDBExprFactory_binary__impl",
+     (DL_FUNC)&savvy_SedonaDBExprFactory_binary__impl, 4},
+    {"savvy_SedonaDBExprFactory_column__impl",
+     (DL_FUNC)&savvy_SedonaDBExprFactory_column__impl, 3},
+    {"savvy_SedonaDBExprFactory_literal__impl",
+     (DL_FUNC)&savvy_SedonaDBExprFactory_literal__impl, 2},
+    {"savvy_SedonaDBExprFactory_new__impl",
+     (DL_FUNC)&savvy_SedonaDBExprFactory_new__impl, 1},
+    {"savvy_SedonaDBExprFactory_scalar_function__impl",
+     (DL_FUNC)&savvy_SedonaDBExprFactory_scalar_function__impl, 3},
+    {NULL, NULL, 0}};
+
+void R_init_sedonadb(DllInfo *dll) {
+  R_registerRoutines(dll, NULL, CallEntries, NULL, NULL);
+  R_useDynamicSymbols(dll, FALSE);
+
+  // Functions for initialization, if any.
+  savvy_init_r_runtime__impl(dll);
+}
