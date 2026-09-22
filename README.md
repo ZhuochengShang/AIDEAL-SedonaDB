@@ -5,7 +5,7 @@ The date in the study/ref names is the setup start date, 2026-09-21; preparation
 
 [Shared AIDEAL study guide](https://github.com/ZhuochengShang/AIDEAL/blob/setup/2026-09-21-library-five-conditions/studies/sedonadb/2026-09-21-five-condition-setup/README.md) · [Source/setup identities](study.json) · [Shared workflow](https://github.com/ZhuochengShang/AIDEAL/blob/setup/2026-09-21-library-five-conditions/docs/SUMMARY.md)
 
-The source repository and shared AIDEAL serve different purposes: these branches hold library source; shared AIDEAL holds prompts, controller/harness code, settings conventions and future reports. The companion repository requires private access.
+The source repository and shared AIDEAL serve different purposes: these branches hold library source; shared AIDEAL holds prompts, controller/harness code, settings conventions and future reports. The companion repository is public.
 Publication policy keeps GitHub Actions disabled while preparation is pending; upstream CI has not validated this setup.
 
 ## Source identity and attribution
@@ -31,7 +31,7 @@ All rows have the same commit/tree today. No historical generated README, aliase
 
 ## Get the source
 
-For one clean source checkout (private repository access required):
+For one clean source checkout (public read access):
 
 ```sh
 git clone -b preparation/2026-09-21-five-conditions/original https://github.com/ZhuochengShang/AIDEAL-SedonaDB.git AIDEAL-SedonaDB
