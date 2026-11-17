@@ -1,0 +1,80 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sedonadb-geopandas"
+description = "GeoPandas-compatible API on top of SedonaDB"
+readme = "README.md"
+requires-python = ">=3.9"
+dynamic = ["version"]
+dependencies = [
+    # `DataFrame.mutate`, which `to_crs()` and column assignment are built on,
+    # first shipped in the released 0.4.1 (it is absent from 0.4.0). Nightlies
+    # version as `0.5.0aN`, which PEP 440 orders above `0.4.1`, so they satisfy
+    # this floor naturally. The APIs this wrapper needs from sedonadb-expr (the
+    # generated .geo accessor methods it calls) are all available in 0.4.0.
+    "sedonadb>=0.4.1",
+    "sedonadb-expr>=0.4.0",
+    "pyarrow",
+    # Geometry scalars (assignment, comparison operands) are Shapely objects;
+    # Shapely 2 dropped the sequence protocol on multipart geometries, which
+    # is what lets a geometry be told apart from an array-like generically.
+    "shapely>=2",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+# GeoPandas interop is opt-in rather than a hard dependency. It routes through
+# sedonadb's pandas/GeoPandas conversion, which needs geoarrow-pyarrow as well
+# as geopandas itself — without it, anything calling to_geopandas() fails with
+# `ModuleNotFoundError: No module named 'geoarrow'`.
+#
+# These are listed directly rather than as `sedonadb[geopandas]` so that
+# installing this package can never cause pip to re-resolve sedonadb itself:
+# in CI sedonadb is an editable build from source, and a resolver that decided
+# to satisfy it from PyPI instead would quietly stop testing the source tree.
+geopandas = [
+    "geopandas",
+    "geoarrow-pyarrow",
+]
+test = [
+    "pytest",
+    "pandas",
+    "geopandas",
+    "geoarrow-pyarrow",
+]
+
+[tool.hatch.version]
+source = "code"
+path = "_version.py"
+expression = "get_version()"
+
+[tool.hatch.build.targets.wheel]
+packages = ["python/sedonadb_geopandas"]

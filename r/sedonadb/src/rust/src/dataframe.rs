@@ -1,0 +1,396 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use arrow_array::ffi::FFI_ArrowSchema;
+use arrow_array::ffi_stream::FFI_ArrowArrayStream;
+use arrow_array::{RecordBatchIterator, RecordBatchReader};
+use datafusion::catalog::MemTable;
+use datafusion::config::ConfigField;
+use datafusion::prelude::DataFrame;
+use datafusion_common::Column;
+use datafusion_expr::utils::conjunction;
+use datafusion_expr::JoinType;
+use datafusion_expr::{select_expr::SelectExpr, Expr, SortExpr};
+use savvy::{savvy, savvy_err, sexp, IntoExtPtrSexp, Result};
+use sedona::context::{SedonaDataFrame, SedonaWriteOptions};
+use sedona::show::{DisplayMode, DisplayTableOptions};
+use sedona_extension::runtime::RuntimeHandle;
+use sedona_extension::streaming::StreamingRecordBatchReader;
+use sedona_extension::table_provider::ExportedTableProvider;
+use sedona_geoparquet::options::TableGeoParquetOptions;
+use sedona_schema::schema::SedonaSchema;
+use std::{iter::zip, ptr::swap_nonoverlapping, sync::Arc};
+
+use crate::context::InternalContext;
+use crate::expression::SedonaDBExprFactory;
+use crate::ffi::{import_schema, SedonaCTableProviderR};
+use crate::runtime::wait_for_future_captured_r;
+
+#[savvy]
+pub struct InternalDataFrame {
+    pub inner: DataFrame,
+    pub runtime: Arc<RuntimeHandle>,
+}
+
+pub fn new_data_frame(inner: DataFrame, runtime: Arc<RuntimeHandle>) -> InternalDataFrame {
+    InternalDataFrame { inner, runtime }
+}
+
+#[savvy]
+impl InternalDataFrame {
+    fn limit(&self, n: f64) -> Result<InternalDataFrame> {
+        let inner = self.inner.clone().limit(0, Some(n.floor() as usize))?;
+        Ok(InternalDataFrame {
+            inner,
+            runtime: self.runtime.clone(),
+        })
+    }
+
+    fn count(&self) -> Result<savvy::Sexp> {
+        let inner = self.inner.clone();
+        let counted =
+            wait_for_future_captured_r(&self.runtime, async move { inner.count().await })??;
+
+        let counted_double = counted as f64;
+        savvy::Sexp::try_from(counted_double)
+    }
+
+    fn primary_geometry_column_index(&self) -> Result<savvy::Sexp> {
+        if let Some(col) = self.inner.schema().primary_geometry_column_index()? {
+            Ok(unsafe { savvy::Sexp(savvy_ffi::Rf_ScalarInteger(col.try_into()?)) })
+        } else {
+            Ok(savvy::NullSexp.into())
+        }
+    }
+
+    fn to_arrow_schema(&self, out: savvy::Sexp) -> Result<()> {
+        let out_void = unsafe { savvy_ffi::R_ExternalPtrAddr(out.0) };
+        if out_void.is_null() {
+            return Err(savvy_err!("external pointer to null in to_arrow_schema()"));
+        }
+
+        let schema_no_qualifiers = self.inner.schema().clone().strip_qualifiers();
+        let schema = schema_no_qualifiers.as_arrow();
+        let mut ffi_schema = FFI_ArrowSchema::try_from(schema)?;
+        let ffi_out = out_void as *mut FFI_ArrowSchema;
+        unsafe { swap_nonoverlapping(&mut ffi_schema, ffi_out, 1) };
+        Ok(())
+    }
+
+    fn to_arrow_stream(&self, out: savvy::Sexp, requested_schema_xptr: savvy::Sexp) -> Result<()> {
+        let out_void = unsafe { savvy_ffi::R_ExternalPtrAddr(out.0) };
+        if out_void.is_null() {
+            return Err(savvy_err!("external pointer to null in to_arrow_stream()"));
+        }
+
+        let maybe_requested_schema = if requested_schema_xptr.is_null() {
+            None
+        } else {
+            Some(import_schema(requested_schema_xptr))
+        };
+
+        if maybe_requested_schema.is_some() {
+            return Err(savvy_err!("Requested schema is not supported"));
+        }
+
+        let inner = self.inner.clone();
+        let stream =
+            wait_for_future_captured_r(
+                &self.runtime,
+                async move { inner.execute_stream().await },
+            )??;
+
+        let reader = StreamingRecordBatchReader::new(stream, self.runtime.clone())
+            .with_skip_empty_batches(true);
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
+
+        let mut ffi_stream = FFI_ArrowArrayStream::new(reader);
+        let ffi_out = out_void as *mut FFI_ArrowArrayStream;
+        unsafe { swap_nonoverlapping(&mut ffi_stream, ffi_out, 1) };
+
+        Ok(())
+    }
+
+    fn to_provider(&self, ctx: &InternalContext) -> Result<savvy::Sexp> {
+        let provider = self.inner.clone().into_view();
+        // Use the actual session state so that object stores, UDFs, and other
+        // registrations are available when the consumer scans the provider.
+        let session = Arc::new(ctx.inner.ctx.state());
+        let exported = ExportedTableProvider::new(provider, session, self.runtime.clone());
+        let ffi_provider: sedona_extension::extension::SedonaCTableProvider = exported.into();
+
+        let mut ffi_xptr = SedonaCTableProviderR(ffi_provider).into_external_pointer();
+        unsafe { savvy_ffi::Rf_protect(ffi_xptr.0) };
+        ffi_xptr.set_class(vec!["sedonadb_table_provider"])?;
+        unsafe { savvy_ffi::Rf_unprotect(1) };
+
+        Ok(ffi_xptr)
+    }
+
+    fn compute(&self, ctx: &InternalContext) -> Result<InternalDataFrame> {
+        let schema = self.inner.schema();
+        let batches =
+            wait_for_future_captured_r(&self.runtime, self.inner.clone().collect_partitioned())??;
+        let provider = Arc::new(MemTable::try_new(
+            schema.as_arrow().clone().into(),
+            batches,
+        )?);
+        let inner = ctx.inner.ctx.read_table(provider)?;
+        Ok(new_data_frame(inner, self.runtime.clone()))
+    }
+
+    fn collect(&self, out: savvy::Sexp) -> Result<savvy::Sexp> {
+        let out_void = unsafe { savvy_ffi::R_ExternalPtrAddr(out.0) };
+        if out_void.is_null() {
+            return Err(savvy_err!("external pointer to null in collect()"));
+        }
+
+        let inner = self.inner.clone();
+        let batches =
+            wait_for_future_captured_r(&self.runtime, async move { inner.collect().await })??;
+
+        let size: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+
+        let reader: Box<dyn RecordBatchReader + Send> = if batches.is_empty() {
+            let schema_no_qualifiers = self.inner.schema().clone().strip_qualifiers();
+            let schema = schema_no_qualifiers.as_arrow();
+            Box::new(RecordBatchIterator::new(
+                vec![].into_iter(),
+                Arc::new(schema.clone()),
+            ))
+        } else {
+            let schema = batches[0].schema();
+            Box::new(RecordBatchIterator::new(
+                batches.into_iter().map(Ok),
+                schema,
+            ))
+        };
+
+        let mut ffi_stream = FFI_ArrowArrayStream::new(reader);
+        let ffi_out = out_void as *mut FFI_ArrowArrayStream;
+        unsafe { swap_nonoverlapping(&mut ffi_stream, ffi_out, 1) };
+
+        savvy::Sexp::try_from(size as f64)
+    }
+
+    fn to_view(&self, ctx: &InternalContext, table_ref: &str, overwrite: bool) -> Result<()> {
+        let provider = self.inner.clone().into_view();
+        if overwrite && ctx.inner.ctx.table_exist(table_ref)? {
+            ctx.deregister_table(table_ref)?;
+        }
+
+        ctx.inner.ctx.register_table(table_ref, provider)?;
+        Ok(())
+    }
+
+    fn show(
+        &self,
+        ctx: &InternalContext,
+        width_chars: i32,
+        ascii: bool,
+        limit: Option<f64>,
+    ) -> Result<savvy::Sexp> {
+        let mut options = DisplayTableOptions::new();
+        options.table_width = width_chars.try_into().unwrap_or(u16::MAX);
+        options.arrow_options = options.arrow_options.with_types_info(true);
+        if !ascii {
+            options.display_mode = DisplayMode::Utf8;
+        }
+
+        let inner = self.inner.clone();
+        let inner_context = ctx.inner.clone();
+        let limit_usize = limit.map(|value| {
+            if value > i32::MAX as f64 {
+                i32::MAX as usize
+            } else {
+                value as usize
+            }
+        });
+
+        let out_string = wait_for_future_captured_r(&self.runtime, async move {
+            inner
+                .show_sedona(&inner_context, limit_usize, options)
+                .await
+        })??;
+
+        savvy::Sexp::try_from(out_string)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn to_parquet(
+        &self,
+        ctx: &InternalContext,
+        path: &str,
+        option_keys: savvy::Sexp,
+        option_values: savvy::Sexp,
+        partition_by: savvy::Sexp,
+        sort_by: savvy::Sexp,
+        single_file_output: bool,
+    ) -> savvy::Result<()> {
+        let option_keys_strsxp = savvy::StringSexp::try_from(option_keys)?;
+        let option_values_strsxp = savvy::StringSexp::try_from(option_values)?;
+
+        let partition_by_strsxp = savvy::StringSexp::try_from(partition_by)?;
+        let partition_by_vec = partition_by_strsxp
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+
+        let sort_by_strsxp = savvy::StringSexp::try_from(sort_by)?;
+        let sort_by_vec = sort_by_strsxp
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+
+        let sort_by_expr = sort_by_vec
+            .iter()
+            .map(|name| {
+                let column = Expr::Column(Column::new_unqualified(name));
+                SortExpr::new(column, true, false)
+            })
+            .collect::<Vec<_>>();
+
+        let write_options = SedonaWriteOptions::new()
+            .with_partition_by(partition_by_vec)
+            .with_sort_by(sort_by_expr)
+            .with_single_file_output(single_file_output);
+
+        let mut writer_options = TableGeoParquetOptions::default();
+
+        // Resolve writer options from the context configuration
+        let global_parquet_options = ctx
+            .inner
+            .ctx
+            .state()
+            .config()
+            .options()
+            .execution
+            .parquet
+            .clone();
+        writer_options.inner.global = global_parquet_options;
+
+        // Apply user-specified options
+        for (k, v) in option_keys_strsxp.iter().zip(option_values_strsxp.iter()) {
+            writer_options
+                .set(k, v)
+                .map_err(|e| savvy::Error::new(format!("{e}")))?;
+        }
+
+        let inner = self.inner.clone();
+        let inner_context = ctx.inner.clone();
+        let path_owned = path.to_string();
+
+        wait_for_future_captured_r(&self.runtime, async move {
+            inner
+                .write_geoparquet(
+                    &inner_context,
+                    &path_owned,
+                    write_options,
+                    Some(writer_options),
+                )
+                .await
+        })??;
+
+        Ok(())
+    }
+
+    fn select_indices(&self, names: sexp::Sexp, indices: sexp::Sexp) -> Result<InternalDataFrame> {
+        let names_strsxp = savvy::StringSexp::try_from(names)?;
+        let indices_intsxp = savvy::IntegerSexp::try_from(indices)?;
+
+        let df_schema = self.inner.schema();
+        let exprs = zip(names_strsxp.iter(), indices_intsxp.iter())
+            .map(|(name, index)| {
+                let (table_ref, field) = df_schema.qualified_field(usize::try_from(*index)?);
+                let column = Column::new(table_ref.cloned(), field.name());
+                Ok(SelectExpr::Expression(Expr::Column(column).alias(name)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let inner = self.inner.clone().select(exprs)?;
+        Ok(new_data_frame(inner, self.runtime.clone()))
+    }
+
+    fn select(&self, exprs_sexp: savvy::Sexp) -> savvy::Result<InternalDataFrame> {
+        let exprs = SedonaDBExprFactory::exprs(exprs_sexp)?;
+        let inner = self.inner.clone().select(exprs)?;
+        Ok(new_data_frame(inner, self.runtime.clone()))
+    }
+
+    fn filter(&self, exprs_sexp: savvy::Sexp) -> savvy::Result<InternalDataFrame> {
+        let exprs = SedonaDBExprFactory::exprs(exprs_sexp)?;
+        let inner = if let Some(single_filter) = conjunction(exprs) {
+            self.inner.clone().filter(single_filter)?
+        } else {
+            self.inner.clone()
+        };
+
+        Ok(new_data_frame(inner, self.runtime.clone()))
+    }
+
+    fn arrange(
+        &self,
+        exprs_sexp: savvy::Sexp,
+        is_descending_sexp: savvy::Sexp,
+    ) -> savvy::Result<InternalDataFrame> {
+        let exprs = SedonaDBExprFactory::exprs(exprs_sexp)?;
+        let is_descending_lglsxp = savvy::LogicalSexp::try_from(is_descending_sexp)?;
+
+        let sort_exprs = zip(exprs, is_descending_lglsxp.iter())
+            .map(|(expr, is_descending)| SortExpr::new(expr, !is_descending, false))
+            .collect::<Vec<_>>();
+
+        let inner = self.inner.clone().sort(sort_exprs)?;
+        Ok(new_data_frame(inner, self.runtime.clone()))
+    }
+
+    fn aggregate(
+        &self,
+        group_by_exprs_sexp: savvy::Sexp,
+        exprs_sexp: savvy::Sexp,
+    ) -> savvy::Result<InternalDataFrame> {
+        let exprs = SedonaDBExprFactory::exprs(exprs_sexp)?;
+        let group_by_exprs = SedonaDBExprFactory::exprs(group_by_exprs_sexp)?;
+
+        let inner = self.inner.clone().aggregate(group_by_exprs, exprs)?;
+        Ok(new_data_frame(inner, self.runtime.clone()))
+    }
+
+    fn join(
+        &self,
+        right: &InternalDataFrame,
+        on_sexp: savvy::Sexp,
+        join_type_str: &str,
+        left_alias: &str,
+        right_alias: &str,
+    ) -> savvy::Result<InternalDataFrame> {
+        let on = SedonaDBExprFactory::exprs(on_sexp)?;
+        let join_type: JoinType = join_type_str.parse()?;
+        let inner = self.inner.clone().alias(left_alias)?.join_on(
+            right.inner.clone().alias(right_alias)?,
+            join_type,
+            on,
+        )?;
+        Ok(new_data_frame(inner, self.runtime.clone()))
+    }
+
+    fn with_params(&self, params_sexp: savvy::Sexp) -> savvy::Result<InternalDataFrame> {
+        let param_values = SedonaDBExprFactory::param_values(params_sexp)?;
+        let inner = self.inner.clone().with_param_values(param_values)?;
+        Ok(new_data_frame(inner, self.runtime.clone()))
+    }
+}

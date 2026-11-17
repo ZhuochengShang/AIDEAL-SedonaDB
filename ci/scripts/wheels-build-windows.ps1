@@ -1,0 +1,106 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# If running locally:
+# $env:VCPKG_ROOT="C:\Users\dewey\Documents\gh\vcpkg"
+# $env:VCPKG_DEFAULT_TRIPLET="x64-windows-dynamic-release"
+# $env:CIBW_BUILD="cp311-win_amd64"
+
+$originalDirectory = Get-Location
+$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+$vcpkgInstalledDirectory = "$env:VCPKG_ROOT\installed\$env:VCPKG_DEFAULT_TRIPLET"
+$vcpkgBinDirectory = "$vcpkgInstalledDirectory\bin"
+$vcpkgLibDirectory = "$vcpkgInstalledDirectory\lib"
+
+# Ensure vcpkg
+try {
+    Push-Location "$env:VCPKG_ROOT"
+	.\bootstrap-vcpkg
+	.\vcpkg --overlay-triplets="${scriptDirectory}/custom-triplets" install geos abseil openssl s2geometry
+	Pop-Location
+}
+finally {
+	# Restore the original working directory
+	Set-Location -Path $originalDirectory
+}
+
+# Download and extract NASM if it doesn't exist
+# On Windows, NASM is required for AWS Rust dependencies
+$NASM_URL = "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip"
+$NASM_DIR = "$scriptDirectory\nasm-2.16.03"
+$NASM_ZIP = "$scriptDirectory\nasm.zip"
+
+if (-not (Test-Path $NASM_DIR)) {
+	Write-Host "Downloading NASM to $NASM_DIR..."
+	New-Item -Path $NASM_DIR -ItemType Directory -Force | Out-Null
+
+	# Download the NASM zip file
+	Invoke-WebRequest -Uri $NASM_URL -OutFile $NASM_ZIP
+
+	# Extract the zip file
+	Expand-Archive -Path $NASM_ZIP -DestinationPath $scriptDirectory -Force
+
+	# Clean up the zip file
+	Remove-Item -Path $NASM_ZIP -Force
+
+	Write-Host "NASM downloaded and extracted to $NASM_DIR"
+} else {
+	Write-Host "NASM directory already exists at $NASM_DIR"
+}
+
+# Add NASM to PATH
+$env:PATH += ";$NASM_DIR"
+
+# Put here/windows on PATH for our fake pkg-config and geos-config executables
+$env:PATH += ";$scriptDirectory\windows"
+
+# Give https://github.com/georust/geos/blob/47afbad2483e489911ddb456417808340e9342c3/sys/build.rs
+# (well, specifically our dummy geos-config) the information it needs to build bindings
+$env:GEOS_LIB_DIR = "$vcpkgLibDirectory"
+$env:GEOS_VERSION = "3.13.0"
+
+$env:MATURIN_PEP517_ARGS='--features s2geography,pyo3/extension-module'
+
+# Some CMake configurations needs this separately from the toolchain file
+$env:CMAKE_PREFIX_PATH="$vcpkgInstalledDirectory"
+$env:OPENSSL_ROOT_DIR="$vcpkgInstalledDirectory"
+
+# Use delvewheel to copy any required dependencies from vcpkg into the wheel
+# combase.dll seems to be required; however, causes errors when copied into the wheel
+# This likely means that the wheel won't work on Windows 7.
+$env:CIBW_REPAIR_WHEEL_COMMAND_WINDOWS="delvewheel repair -v --exclude=combase.dll --add-path=$vcpkgBinDirectory --wheel-dir={dest_dir} {wheel}"
+
+# Quality of life: don't change the working directory of the calling script even when it fails
+$parentDirectory = Split-Path -Parent (Split-Path -Parent $scriptDirectory)
+try {
+    # Compile windows/geos-config.rs into an executable using cargo. We need these because
+    # vcpkg for GEOS does not build geos-config and because the rust geos crate requires
+    # pkg-config to be available even if it cannot find GEOS.
+    Push-Location "$scriptDirectory\windows"
+	cargo build --release
+	Copy-Item ".\target\release\geos-config.exe" ".\geos-config.exe" -Force
+	Copy-Item ".\target\release\pkg-config.exe" ".\pkg-config.exe" -Force
+	Pop-Location
+
+	Push-Location "$parentDirectory"
+	python -m cibuildwheel --output-dir python\sedonadb\dist python\sedonadb
+	Pop-Location
+}
+finally {
+	# Restore the original working directory
+	Set-Location -Path $originalDirectory
+}

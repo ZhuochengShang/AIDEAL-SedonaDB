@@ -1,0 +1,536 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+use std::{sync::Arc, vec};
+
+use arrow_array::builder::BinaryViewBuilder;
+use arrow_schema::DataType;
+use datafusion_common::error::{DataFusionError, Result};
+use datafusion_expr::{ColumnarValue, Volatility};
+use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
+use sedona_geometry::types::{GeometryTypeAndDimensions, GeometryTypeId};
+use sedona_schema::{
+    datatypes::{
+        SedonaType, WKB_GEOMETRY, WKB_LARGE_GEOMETRY, WKB_VIEW_GEOGRAPHY, WKB_VIEW_GEOGRAPHY_WGS84,
+        WKB_VIEW_GEOMETRY,
+    },
+    matchers::ArgMatcher,
+};
+
+use crate::{executor::WkbExecutor, st_setsrid::SRIDifiedKernel};
+
+/// ST_GeomFromWKB() scalar UDF implementation
+///
+/// An implementation of WKB reading using GeoRust's wkb crate.
+pub fn st_geomfromwkb_udf() -> SedonaScalarUDF {
+    let kernel = Arc::new(STGeomFromWKB {
+        validate: true,
+        out_type: WKB_VIEW_GEOMETRY,
+        expected_geom_type: None,
+    });
+    let sridified_kernel = Arc::new(SRIDifiedKernel::new(kernel.clone()));
+    SedonaScalarUDF::new(
+        "st_geomfromwkb",
+        vec![sridified_kernel, kernel],
+        Volatility::Immutable,
+    )
+}
+
+/// ST_GeomFromWKBUnchecked() scalar UDF implementation
+///
+/// An implementation of WKB reading using GeoRust's wkb crate without validation.
+pub fn st_geomfromwkbunchecked_udf() -> SedonaScalarUDF {
+    SedonaScalarUDF::new(
+        "st_geomfromwkbunchecked",
+        vec![Arc::new(STGeomFromWKB {
+            validate: false,
+            out_type: WKB_VIEW_GEOMETRY,
+            expected_geom_type: None,
+        })],
+        Volatility::Immutable,
+    )
+}
+
+/// ST_GeogFromWKB() scalar UDF implementation
+///
+/// An implementation of WKB reading using GeoRust's wkb crate.
+pub fn st_geogfromwkb_udf() -> SedonaScalarUDF {
+    // Inner kernel for SRIDified has no CRS - the SRID argument sets it
+    let inner_kernel = Arc::new(STGeomFromWKB {
+        validate: true,
+        out_type: WKB_VIEW_GEOGRAPHY,
+        expected_geom_type: None,
+    });
+    let sridified_kernel = Arc::new(SRIDifiedKernel::new(inner_kernel));
+
+    // Standalone kernel returns WGS84 CRS by default
+    let standalone_kernel = Arc::new(STGeomFromWKB {
+        validate: true,
+        out_type: WKB_VIEW_GEOGRAPHY_WGS84.clone(),
+        expected_geom_type: None,
+    });
+
+    SedonaScalarUDF::new(
+        "st_geogfromwkb",
+        vec![sridified_kernel, standalone_kernel],
+        Volatility::Immutable,
+    )
+}
+
+fn make_typed_geom_udf(name: &'static str, expected: GeometryTypeId) -> SedonaScalarUDF {
+    let kernel = Arc::new(STGeomFromWKB {
+        validate: true,
+        out_type: WKB_VIEW_GEOMETRY,
+        expected_geom_type: Some(expected),
+    });
+    let sridified_kernel = Arc::new(SRIDifiedKernel::new(kernel.clone()));
+    SedonaScalarUDF::new(name, vec![sridified_kernel, kernel], Volatility::Immutable)
+}
+
+/// ST_LineStringFromWKB() scalar UDF implementation
+pub fn st_linestringfromwkb_udf() -> SedonaScalarUDF {
+    make_typed_geom_udf("st_linestringfromwkb", GeometryTypeId::LineString)
+        .with_aliases(vec!["st_linefromwkb".to_string()])
+}
+
+/// ST_PointFromWKB() scalar UDF implementation
+pub fn st_pointfromwkb_udf() -> SedonaScalarUDF {
+    make_typed_geom_udf("st_pointfromwkb", GeometryTypeId::Point)
+}
+
+#[derive(Debug)]
+struct STGeomFromWKB {
+    validate: bool,
+    out_type: SedonaType,
+    expected_geom_type: Option<GeometryTypeId>,
+}
+
+impl SedonaScalarKernel for STGeomFromWKB {
+    fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+        let matcher = ArgMatcher::new(vec![ArgMatcher::is_binary()], self.out_type.clone());
+        matcher.match_args(args)
+    }
+
+    fn invoke_batch(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+    ) -> Result<ColumnarValue> {
+        if self.validate {
+            let iter_type = match &arg_types[0] {
+                SedonaType::Arrow(data_type) => match data_type {
+                    DataType::Binary => WKB_GEOMETRY,
+                    DataType::LargeBinary => WKB_LARGE_GEOMETRY,
+                    DataType::BinaryView => WKB_VIEW_GEOGRAPHY,
+                    DataType::Null => WKB_VIEW_GEOMETRY,
+                    _ => unreachable!(),
+                },
+                _ => {
+                    unreachable!()
+                }
+            };
+
+            let temp_args = [iter_type];
+            let executor = WkbExecutor::new(&temp_args, args);
+            if let Some(expected) = self.expected_geom_type {
+                let mut builder = BinaryViewBuilder::with_capacity(executor.num_iterations());
+                if matches!(arg_types[0], SedonaType::Arrow(DataType::Null)) {
+                    for _ in 0..executor.num_iterations() {
+                        builder.append_null();
+                    }
+                    return executor.finish(Arc::new(builder.finish()));
+                }
+
+                executor.execute_wkb_void(|maybe_item| {
+                    match maybe_item {
+                        Some(item)
+                            if GeometryTypeAndDimensions::try_from_geom(item)
+                                .map_err(|err| DataFusionError::External(Box::new(err)))?
+                                .geometry_type()
+                                == expected =>
+                        {
+                            builder.append_value(item.buf())
+                        }
+                        _ => builder.append_null(),
+                    }
+                    Ok(())
+                })?;
+                return executor.finish(Arc::new(builder.finish()));
+            }
+
+            executor.execute_wkb_void(|_maybe_item| Ok(()))?;
+        }
+
+        args[0].cast_to(self.out_type.storage_type(), None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, create_array};
+    use datafusion_common::scalar::ScalarValue;
+    use datafusion_expr::ScalarUDF;
+    use rstest::rstest;
+    use sedona_testing::{
+        compare::{assert_array_equal, assert_scalar_equal},
+        create::{
+            create_array, create_array_item_crs, create_array_storage, create_scalar, make_wkb,
+        },
+        testers::ScalarUdfTester,
+    };
+
+    use super::*;
+
+    const POINT12: [u8; 21] = [
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
+    ];
+    const INVALID_WKB_LEN: [u8; 0] = [];
+    const INVALID_WKB_CONTENT: [u8; 5] = [0x01, 0x00, 0x00, 0x00, 0x00];
+    const INVALID_WKBS: [&[u8]; 2] = [&INVALID_WKB_LEN, &INVALID_WKB_CONTENT];
+
+    #[test]
+    fn udf_metadata() {
+        let geog_from_wkb: ScalarUDF = st_geogfromwkb_udf().into();
+        assert_eq!(geog_from_wkb.name(), "st_geogfromwkb");
+        assert!(geog_from_wkb.documentation().is_none());
+
+        let geom_from_wkb: ScalarUDF = st_geomfromwkb_udf().into();
+        assert_eq!(geom_from_wkb.name(), "st_geomfromwkb");
+        assert!(geom_from_wkb.documentation().is_none());
+
+        let geom_from_wkb_unchecked: ScalarUDF = st_geomfromwkbunchecked_udf().into();
+        assert_eq!(geom_from_wkb_unchecked.name(), "st_geomfromwkbunchecked");
+        assert!(geom_from_wkb_unchecked.documentation().is_none());
+
+        let linestring_from_wkb: ScalarUDF = st_linestringfromwkb_udf().into();
+        assert_eq!(linestring_from_wkb.name(), "st_linestringfromwkb");
+        assert!(
+            linestring_from_wkb
+                .aliases()
+                .contains(&"st_linefromwkb".to_string())
+        );
+
+        let point_from_wkb: ScalarUDF = st_pointfromwkb_udf().into();
+        assert_eq!(point_from_wkb.name(), "st_pointfromwkb");
+    }
+
+    #[rstest]
+    #[case(st_pointfromwkb_udf(), "POINT (1 2)", "LINESTRING (0 0, 1 1)")]
+    #[case(st_linestringfromwkb_udf(), "LINESTRING (0 0, 1 1)", "POINT (1 2)")]
+    fn typed_udf_accepts_matching_type_and_nulls_other_types(
+        #[values(DataType::Binary, DataType::BinaryView)] data_type: DataType,
+        #[case] udf: SedonaScalarUDF,
+        #[case] matching_wkt: &str,
+        #[case] wrong_wkt: &str,
+    ) {
+        let tester = ScalarUdfTester::new(udf.into(), vec![SedonaType::Arrow(data_type)]);
+        assert_eq!(tester.return_type().unwrap(), WKB_VIEW_GEOMETRY);
+
+        assert_scalar_equal(
+            &tester.invoke_scalar(make_wkb(matching_wkt)).unwrap(),
+            &create_scalar(Some(matching_wkt), &WKB_VIEW_GEOMETRY),
+        );
+        assert_scalar_equal(
+            &tester.invoke_scalar(make_wkb(wrong_wkt)).unwrap(),
+            &create_scalar(None, &WKB_VIEW_GEOMETRY),
+        );
+        assert_scalar_equal(
+            &tester.invoke_scalar(ScalarValue::Null).unwrap(),
+            &create_scalar(None, &WKB_VIEW_GEOMETRY),
+        );
+    }
+
+    #[test]
+    fn typed_udf_array() {
+        let tester = ScalarUdfTester::new(
+            st_linestringfromwkb_udf().into(),
+            vec![SedonaType::Arrow(DataType::Binary)],
+        );
+        let line = make_wkb("LINESTRING (0 0, 1 1)");
+        let point = make_wkb("POINT (1 2)");
+        let input: BinaryArray = [Some(line.as_slice()), Some(point.as_slice()), None]
+            .into_iter()
+            .collect();
+
+        assert_array_equal(
+            &tester.invoke_array(Arc::new(input)).unwrap(),
+            &create_array(
+                &[Some("LINESTRING (0 0, 1 1)"), None, None],
+                &WKB_VIEW_GEOMETRY,
+            ),
+        );
+    }
+
+    #[rstest]
+    #[case(st_geomfromwkb_udf())]
+    #[case(st_linestringfromwkb_udf())]
+    #[case(st_pointfromwkb_udf())]
+    fn udf_untyped_null(#[case] udf: SedonaScalarUDF) {
+        let tester = ScalarUdfTester::new(udf.into(), vec![SedonaType::Arrow(DataType::Null)]);
+
+        assert_scalar_equal(
+            &tester.invoke_scalar(ScalarValue::Null).unwrap(),
+            &create_scalar(None, &WKB_VIEW_GEOMETRY),
+        );
+    }
+
+    #[rstest]
+    #[case(st_pointfromwkb_udf())]
+    #[case(st_linestringfromwkb_udf())]
+    fn typed_wkb_null_column(#[case] udf: SedonaScalarUDF) {
+        let tester = ScalarUdfTester::new(udf.into(), vec![SedonaType::Arrow(DataType::Null)]);
+        let result = tester
+            .invoke_array(Arc::new(arrow_array::NullArray::new(3)))
+            .unwrap();
+
+        assert_eq!(tester.return_type().unwrap(), WKB_VIEW_GEOMETRY);
+        assert_array_equal(
+            &result,
+            &create_array(&[None::<&str>, None, None], &WKB_VIEW_GEOMETRY),
+        );
+    }
+
+    #[rstest]
+    #[case(st_pointfromwkb_udf(), "POINT (1 2)")]
+    #[case(st_linestringfromwkb_udf(), "LINESTRING (0 0, 1 1)")]
+    fn typed_udf_accepts_srid(#[case] udf: SedonaScalarUDF, #[case] wkt: &str) {
+        let tester = ScalarUdfTester::new(
+            udf.into(),
+            vec![
+                SedonaType::Arrow(DataType::Binary),
+                SedonaType::Arrow(DataType::UInt32),
+            ],
+        );
+
+        assert_scalar_equal(
+            &tester.invoke_scalar_scalar(make_wkb(wkt), 4326u32).unwrap(),
+            &create_scalar(Some(wkt), &WKB_VIEW_GEOMETRY),
+        );
+    }
+
+    #[rstest]
+    fn udf(
+        #[values(DataType::Binary, DataType::LargeBinary, DataType::BinaryView)]
+        data_type: DataType,
+    ) {
+        let udf = st_geomfromwkb_udf();
+        let tester = ScalarUdfTester::new(
+            udf.clone().into(),
+            vec![SedonaType::Arrow(data_type.clone())],
+        );
+
+        assert_eq!(tester.return_type().unwrap(), WKB_VIEW_GEOMETRY);
+
+        assert_scalar_equal(
+            &tester.invoke_scalar(POINT12.to_vec()).unwrap(),
+            &create_scalar(Some("POINT (1 2)"), &WKB_VIEW_GEOMETRY),
+        );
+
+        assert_scalar_equal(
+            &tester.invoke_scalar(ScalarValue::Null).unwrap(),
+            &create_scalar(None, &WKB_VIEW_GEOMETRY),
+        );
+
+        let binary_array: BinaryArray = [Some(POINT12), None, Some(POINT12)].iter().collect();
+        assert_array_equal(
+            &tester.invoke_array(Arc::new(binary_array)).unwrap(),
+            &create_array(
+                &[Some("POINT (1 2)"), None, Some("POINT (1 2)")],
+                &WKB_VIEW_GEOMETRY,
+            ),
+        );
+    }
+
+    #[rstest]
+    fn udf_unchecked(
+        #[values(DataType::Binary, DataType::LargeBinary, DataType::BinaryView)]
+        data_type: DataType,
+    ) {
+        let udf = st_geomfromwkbunchecked_udf();
+        let tester = ScalarUdfTester::new(
+            udf.clone().into(),
+            vec![SedonaType::Arrow(data_type.clone())],
+        );
+
+        assert_eq!(tester.return_type().unwrap(), WKB_VIEW_GEOMETRY);
+
+        assert_scalar_equal(
+            &tester.invoke_scalar(POINT12.to_vec()).unwrap(),
+            &create_scalar(Some("POINT (1 2)"), &WKB_VIEW_GEOMETRY),
+        );
+
+        assert_scalar_equal(
+            &tester.invoke_scalar(ScalarValue::Null).unwrap(),
+            &create_scalar(None, &WKB_VIEW_GEOMETRY),
+        );
+
+        let binary_array: BinaryArray = [Some(POINT12), None, Some(POINT12)].iter().collect();
+        assert_array_equal(
+            &tester.invoke_array(Arc::new(binary_array)).unwrap(),
+            &create_array(
+                &[Some("POINT (1 2)"), None, Some("POINT (1 2)")],
+                &WKB_VIEW_GEOMETRY,
+            ),
+        );
+    }
+
+    #[test]
+    fn invalid_wkb() {
+        for udf in [
+            st_geomfromwkb_udf(),
+            st_linestringfromwkb_udf(),
+            st_pointfromwkb_udf(),
+        ] {
+            let tester =
+                ScalarUdfTester::new(udf.into(), vec![SedonaType::Arrow(DataType::Binary)]);
+
+            for invalid in INVALID_WKBS {
+                let _err = tester
+                    .invoke_scalar(ScalarValue::Binary(Some(invalid.to_vec())))
+                    .unwrap_err();
+            }
+        }
+    }
+
+    #[rstest]
+    fn unchecked_invalid_wkb(
+        #[values(DataType::Binary, DataType::LargeBinary, DataType::BinaryView)]
+        data_type: DataType,
+    ) {
+        let udf = st_geomfromwkbunchecked_udf();
+        let tester = ScalarUdfTester::new(udf.into(), vec![SedonaType::Arrow(data_type.clone())]);
+
+        for invalid in INVALID_WKBS {
+            let invalid_scalar = match data_type {
+                DataType::Binary => ScalarValue::Binary(Some(invalid.to_vec())),
+                DataType::LargeBinary => ScalarValue::LargeBinary(Some(invalid.to_vec())),
+                DataType::BinaryView => ScalarValue::BinaryView(Some(invalid.to_vec())),
+                _ => unreachable!(),
+            };
+
+            assert_scalar_equal(
+                &tester.invoke_scalar(invalid_scalar).unwrap(),
+                &ScalarValue::BinaryView(Some(invalid.to_vec())),
+            );
+
+            let input_array: ArrayRef = match data_type {
+                DataType::Binary => Arc::new(
+                    [Some(invalid), None, Some(invalid)]
+                        .iter()
+                        .collect::<BinaryArray>(),
+                ),
+                DataType::LargeBinary => Arc::new(
+                    [Some(invalid), None, Some(invalid)]
+                        .iter()
+                        .collect::<LargeBinaryArray>(),
+                ),
+                DataType::BinaryView => Arc::new(
+                    [Some(invalid), None, Some(invalid)]
+                        .iter()
+                        .collect::<BinaryViewArray>(),
+                ),
+                _ => unreachable!(),
+            };
+
+            let expected_array: BinaryViewArray =
+                [Some(invalid), None, Some(invalid)].iter().collect();
+
+            assert_array_equal(
+                &tester.invoke_array(input_array).unwrap(),
+                &(Arc::new(expected_array) as ArrayRef),
+            );
+        }
+    }
+
+    #[test]
+    fn udf_invoke_with_array_crs() {
+        let udf = st_geomfromwkb_udf();
+        let tester = ScalarUdfTester::new(
+            udf.into(),
+            vec![
+                SedonaType::Arrow(DataType::Binary),
+                SedonaType::Arrow(DataType::Utf8),
+            ],
+        );
+
+        let return_type = tester.return_type().unwrap();
+        assert_eq!(
+            return_type,
+            SedonaType::new_item_crs(&WKB_VIEW_GEOMETRY).unwrap()
+        );
+
+        let sedona_type = WKB_GEOMETRY;
+        let wkb_array = create_array_storage(
+            &[
+                Some("POINT (0 1)"),
+                Some("POINT (2 3)"),
+                Some("POINT (4 5)"),
+                Some("POINT (6 7)"),
+                None,
+            ],
+            &sedona_type,
+        );
+        let crs_array = create_array!(
+            Utf8,
+            [
+                Some("EPSG:4326"),
+                Some("EPSG:3857"),
+                Some("EPSG:3857"),
+                Some("0"),
+                None
+            ]
+        ) as ArrayRef;
+
+        let result = tester.invoke_arrays(vec![wkb_array, crs_array]).unwrap();
+        assert_eq!(
+            &result,
+            &create_array_item_crs(
+                &[
+                    Some("POINT (0 1)"),
+                    Some("POINT (2 3)"),
+                    Some("POINT (4 5)"),
+                    Some("POINT (6 7)"),
+                    None
+                ],
+                [
+                    Some("EPSG:4326"),
+                    Some("EPSG:3857"),
+                    Some("EPSG:3857"),
+                    None,
+                    None
+                ],
+                &WKB_VIEW_GEOMETRY
+            )
+        );
+    }
+
+    #[test]
+    fn geog() {
+        let udf = st_geogfromwkb_udf();
+        let tester = ScalarUdfTester::new(udf.into(), vec![SedonaType::Arrow(DataType::Binary)]);
+
+        assert_eq!(
+            tester.return_type().unwrap(),
+            WKB_VIEW_GEOGRAPHY_WGS84.clone()
+        );
+
+        assert_scalar_equal(
+            &tester.invoke_scalar(POINT12.to_vec()).unwrap(),
+            &create_scalar(Some("POINT (1 2)"), &WKB_VIEW_GEOGRAPHY_WGS84),
+        );
+    }
+}
