@@ -1,0 +1,534 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+#' Create SedonaDB logical expressions
+#'
+#' @param column_name A column name
+#' @param x An object to convert to a SedonaDB literal (constant).
+#' @param qualifier An optional qualifier (e.g., table reference) that may be
+#'   used to disambiguate a specific reference
+#' @param function_name The name of the function to call. This name is resolved
+#'   from the context associated with `factory`.
+#' @param type A destination type into which `expr` should be cast.
+#' @param expr A SedonaDBExpr or object coercible to one with [as_sd_expr()].
+#' @param alias An alias to apply to `expr`.
+#' @param op Operator name for a binary expression. In general these follow
+#'   R function names (e.g., `>`, `<`, `+`, `-`).
+#' @param lhs,rhs Arguments to a binary expression
+#' @param factory A [sd_expr_factory()]. This factory wraps a SedonaDB context
+#'   and is used to resolve scalar functions and/or retrieve options.
+#' @param ctx A SedonaDB context or NULL to use the default context.
+#' @param args A list of SedonaDBExpr or object coercible to one with
+#'   [as_sd_expr()].
+#' @param na.rm For aggregate expressions, should nulls be ignored? The R
+#'   idiom is to respect null; however, the SQL idiom is to drop them. The
+#'   default value follows the R idiom (`na.rm = FALSE`).
+#' @param distinct For aggregate expressions, use only distinct values.
+#' @param ... Reserved for future use
+#'
+#' @returns An object of class SedonaDBExpr
+#' @export
+#'
+#' @examples
+#' sd_expr_column("foofy")
+#' sd_expr_literal(1L)
+#' sd_expr_scalar_function("abs", list(1L))
+#' sd_expr_cast(1L, nanoarrow::na_int64())
+#' sd_expr_alias(1L, "foofy")
+#'
+sd_expr_column <- function(column_name, qualifier = NULL, factory = sd_expr_factory()) {
+  factory$column(column_name, qualifier)
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_literal <- function(x, type = NULL, factory = sd_expr_factory()) {
+  as_sedonadb_literal(x, type = type, factory = factory)
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_binary <- function(op, lhs, rhs, factory = sd_expr_factory()) {
+  factory$binary(op, as_sd_expr(lhs), as_sd_expr(rhs))
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_negative <- function(expr, factory = sd_expr_factory()) {
+  as_sd_expr(expr, factory = factory)$negate()
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_is_null <- function(expr, factory = sd_expr_factory()) {
+  as_sd_expr(expr, factory = factory)$is_null()
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_is_not_null <- function(expr, factory = sd_expr_factory()) {
+  as_sd_expr(expr, factory = factory)$is_not_null()
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_not <- function(expr, factory = sd_expr_factory()) {
+  as_sd_expr(expr, factory = factory)$not()
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_any_function <- function(
+  function_name,
+  args,
+  ...,
+  na.rm = NULL, # nolint: object_name_linter
+  factory = sd_expr_factory()
+) {
+  args_as_expr <- lapply(args, as_sd_expr, factory = factory)
+  factory$any_function(function_name, args_as_expr, na_rm = na.rm)
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_scalar_function <- function(function_name, args, factory = sd_expr_factory()) {
+  args_as_expr <- lapply(args, as_sd_expr, factory = factory)
+  factory$scalar_function(function_name, args_as_expr)
+}
+
+# Construct access to a named field of a nested expression.
+sd_expr_get_field <- function(expr, field_name, factory) {
+  if (!is.character(field_name) || length(field_name) != 1L || is.na(field_name)) {
+    rlang::abort("`field_name` must be a single non-missing string")
+  }
+
+  field_name_expr <- sd_expr_literal(field_name, factory = factory)
+  factory$scalar_function(
+    "get_field",
+    list(expr, field_name_expr)
+  )
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_aggregate_function <- function(
+  function_name,
+  args,
+  ...,
+  na.rm = FALSE, # nolint: object_name_linter
+  distinct = FALSE,
+  factory = sd_expr_factory()
+) {
+  args_as_expr <- lapply(args, as_sd_expr, factory = factory)
+  factory$aggregate_function(
+    function_name,
+    args_as_expr,
+    na_rm = na.rm,
+    distinct = distinct
+  )
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_cast <- function(expr, type, factory = sd_expr_factory()) {
+  expr <- as_sd_expr(expr, factory = factory)
+  type <- nanoarrow::as_nanoarrow_schema(type)
+  expr$cast(type)
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_alias <- function(expr, alias, factory = sd_expr_factory()) {
+  expr <- as_sd_expr(expr, factory = factory)
+  expr$alias(alias)
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_parse_binary <- function(expr) {
+  result <- expr$parse_binary()
+  if (is.null(result)) {
+    return(NULL)
+  }
+
+  result$left <- .savvy_wrap_SedonaDBExpr(result$left)
+  result$right <- .savvy_wrap_SedonaDBExpr(result$right)
+  result
+}
+
+#' @rdname sd_expr_column
+#' @export
+as_sd_expr <- function(x, factory = sd_expr_factory()) {
+  if (inherits(x, "SedonaDBExpr")) {
+    x
+  } else {
+    sd_expr_literal(x, factory = factory)
+  }
+}
+
+#' @rdname sd_expr_column
+#' @export
+is_sd_expr <- function(x) {
+  inherits(x, "SedonaDBExpr")
+}
+
+#' @rdname sd_expr_column
+#' @export
+sd_expr_factory <- function(ctx = NULL) {
+  if (is.null(ctx)) {
+    ctx <- ctx()
+  }
+
+  SedonaDBExprFactory$new(ctx)
+}
+
+#' @export
+print.SedonaDBExpr <- function(x, ...) {
+  cat("<SedonaDBExpr>\n")
+  cat(x$display())
+  cat("\n")
+  invisible(x)
+}
+
+#' SedonaDB Functions
+#'
+#' This object is an escape hatch for calling SedonaDB/DataFusion functions
+#' directly for translations that are not yet registered or are otherwise
+#' misbehaving.
+#'
+#' @export .fns
+.fns <- structure(list(), class = "sedonadb_fns")
+
+# For IDE autocomplete
+#' @export
+names.sedonadb_fns <- function(x) {
+  ctx <- ctx()
+  ctx$list_functions()
+}
+
+# nolint start: object_name_linter
+#' @importFrom utils .DollarNames
+#' @export
+.DollarNames.sedonadb_fns <- function(x, pattern = "") {
+  grep(pattern, names(x), value = TRUE)
+}
+# nolint end
+
+#' Evaluate an R expression into a SedonaDB expression
+#'
+#' @param expr An R expression (e.g., the result of `quote()`).
+#' @param expr_ctx An `sd_expr_ctx()`
+#' @param env An evaluation environment. Defaults to the calling environment.
+#'
+#' @returns A `SedonaDBExpr`
+#' @noRd
+sd_eval_expr <- function(expr, expr_ctx = sd_expr_ctx(env = env), env = parent.frame()) {
+  ensure_translations_registered()
+
+  rlang::try_fetch(
+    {
+      result <- sd_eval_expr_inner(expr, expr_ctx)
+      as_sd_expr(result, factory = expr_ctx$factory)
+    },
+    error = function(e) {
+      rlang::abort(
+        sprintf("Error evaluating translated expression %s", rlang::expr_label(expr)),
+        parent = e
+      )
+    }
+  )
+}
+
+sd_eval_expr_inner <- function(expr, expr_ctx) {
+  if (rlang::is_call(expr)) {
+    # .fns$fn() is special syntax for the escape hatch of "just call a
+    # DataFusion function". In this case, expr is the function invocation and
+    # expr[[1]] is the `$` call `.fns$fn`. This is distinct from struct field
+    # access below, where expr itself is the `$` call.
+    if (rlang::is_call(expr[[1]], "$") && rlang::is_symbol(expr[[1]][[2]], ".fns")) {
+      fn_key <- as.character(expr[[1]][[3]])
+      return(sd_eval_datafusion_fn(fn_key, expr, expr_ctx))
+    }
+
+    # For foo$bar, expr itself is a `$` call: expr[[1]] is the symbol `$`,
+    # expr[[2]] is foo, and expr[[3]] is bar. Evaluate the left-hand side
+    # recursively so the top-level column is resolved through the data mask
+    # and chained field access such as foo$bar$baz works.
+    if (rlang::is_call(expr, "$")) {
+      lhs <- sd_eval_expr_inner(expr[[2]], expr_ctx)
+      if (is_sd_expr(lhs)) {
+        return(
+          sd_expr_get_field(
+            lhs,
+            as.character(expr[[3]]),
+            factory = expr_ctx$factory
+          )
+        )
+      }
+    }
+
+    # Extract `pkg::fun` or `fun` if this is a usual call (e.g., not
+    # something fancy like `fun()()`)
+    call_name <- rlang::call_name(expr)
+
+    # If this is not a fancy function call and  we have a translation, call it.
+    # Individual translations can choose to defer to the R function if all the
+    # arguments are R objects and not SedonaDB expressions (or the user can
+    # use !! to force R evaluation).
+    if (!is.null(call_name) && !is.null(expr_ctx$fns[[call_name]])) {
+      sd_eval_translation(call_name, expr, expr_ctx)
+    } else {
+      sd_eval_default(expr, expr_ctx)
+    }
+  } else {
+    sd_eval_default(expr, expr_ctx)
+  }
+}
+
+sd_eval_datafusion_fn <- function(fn_key, expr, expr_ctx) {
+  # Evaluate arguments
+  evaluated_args <- lapply(expr[-1], sd_eval_expr_inner, expr_ctx = expr_ctx)
+
+  na_rm <- evaluated_args$na.rm
+  evaluated_args$na.rm <- NULL
+
+  if (any(rlang::have_name(evaluated_args))) {
+    stop(
+      sprintf(
+        "Expected unnamed arguments to SedonaDB SQL function but got %s",
+        paste(
+          names(evaluated_args)[rlang::have_name(evaluated_args)],
+          collapse = ", "
+        )
+      )
+    )
+  }
+
+  sd_expr_any_function(fn_key, evaluated_args, na.rm = na_rm, factory = expr_ctx$factory)
+}
+
+sd_eval_translation <- function(fn_key, expr, expr_ctx) {
+  # Replace the function with the translation in such a way that
+  # any error resulting from the call doesn't have an absolute garbage error
+  # stack trace
+  new_fn_expr <- rlang::call2("$", expr_ctx$fns, rlang::sym(fn_key))
+
+  # Evaluate arguments individually. We may need to allow translations to
+  # override this step to have more control over the expression evaluation.
+  evaluated_args <- lapply(expr[-1], sd_eval_expr_inner, expr_ctx = expr_ctx)
+
+  # Recreate the call, injecting the context as the first argument
+  new_call <- rlang::call2(new_fn_expr, expr_ctx, !!!evaluated_args)
+
+  # ...and evaluate it
+  sd_eval_default(new_call, expr_ctx)
+}
+
+sd_eval_default <- function(expr, expr_ctx) {
+  rlang::eval_tidy(expr, data = expr_ctx$data, env = expr_ctx$env)
+}
+
+# Needed for sd_arrange(), as wrapping expression in desc() is how a descending
+# sort order is specified. Unwraps desc(inner_expr) to separate the expressions.
+unwrap_desc <- function(exprs) {
+  inner_exprs <- vector("list", length(exprs))
+  is_descending <- vector("logical", length(exprs))
+  for (i in seq_along(exprs)) {
+    expr <- exprs[[i]]
+
+    if (rlang::is_call(expr, "desc") || rlang::is_call(expr, "desc", ns = "dplyr")) {
+      inner_exprs[[i]] <- expr[[2]]
+      is_descending[[i]] <- TRUE
+    } else {
+      inner_exprs[[i]] <- expr
+      is_descending[[i]] <- FALSE
+    }
+  }
+
+  list(inner_exprs = inner_exprs, is_descending = is_descending)
+}
+
+#' Expression evaluation context
+#'
+#' A context to use for evaluating a set of related R expressions into
+#' SedonaDB expressions. One expression context may be used to translate
+#' multiple expressions (e.g., all arguments to `mutate()`).
+#'
+#' @param schema A schema-like object coerced using
+#'   [nanoarrow::as_nanoarrow_schema()]. This is used to create the data mask
+#'   for expressions.
+#' @param env The expression environment. This is needed to evaluate expressions.
+#' @param ctx A SedonaDB context whose function registry should be used to resolve
+#'   functions.
+#'
+#' @return An object of class sedonadb_expr_ctx
+#' @noRd
+sd_expr_ctx <- function(schema = NULL, env = parent.frame(), ctx = NULL) {
+  if (is.null(schema)) {
+    schema <- nanoarrow::na_struct()
+  }
+
+  schema <- nanoarrow::as_nanoarrow_schema(schema)
+  data_names <- as.character(names(schema$children))
+
+  # Duplicate names can't be referred to with the mask. We could install these
+  # as an active binding to give an error message if they are referred to.
+  ambiguous_names <- unique(data_names[duplicated(data_names)])
+  data_names <- setdiff(data_names, ambiguous_names)
+  data <- lapply(data_names, sd_expr_column)
+  names(data) <- data_names
+
+  structure(
+    list(
+      factory = sd_expr_factory(ctx = ctx),
+      schema = schema,
+      data = rlang::as_data_mask(data),
+      env = env,
+      fns = default_fns
+    ),
+    class = "sedonadb_expr_ctx"
+  )
+}
+
+#' Register an R function translation into a SedonaDB expression
+#'
+#' @param qualified_name The name of the function in the form `pkg::fun` or
+#'   `fun` if the package name is not relevant. This allows translations to
+#'   support calls to `fun()` or `pkg::fun()` that appear in an R expression.
+#' @param fn A function. The first argument must always be `.ctx`, which
+#'   is the instance of `sd_expr_ctx()` that may be used to construct
+#'   the required expressions (using `$factory`).
+#'
+#' @returns fn, invisibly
+#' @noRd
+sd_register_translation <- function(qualified_name, fn) {
+  stopifnot(is.function(fn))
+
+  pieces <- strsplit(qualified_name, "::")[[1]]
+  unqualified_name <- pieces[[2]]
+
+  default_fns[[qualified_name]] <- default_fns[[unqualified_name]] <- fn
+  invisible(fn)
+}
+
+#' Register a translation that always forwards its arguments to DataFusion
+#'
+#' @param fn_name The name of the function
+#' @returns fn, invisibly
+#' @noRd
+sd_register_datafusion_fn <- function(fn_name) {
+  force(fn_name)
+
+  fn <- function(.ctx, ...) {
+    evaluated_args <- list(...)
+    na_rm <- evaluated_args$na.rm
+    evaluated_args$na.rm <- NULL
+
+    if (any(rlang::have_name(evaluated_args))) {
+      stop(
+        sprintf(
+          "Expected unnamed arguments to SedonaDB SQL function but got %s",
+          paste(
+            names(evaluated_args)[rlang::have_name(evaluated_args)],
+            collapse = ", "
+          )
+        )
+      )
+    }
+
+    sd_expr_any_function(
+      fn_name,
+      evaluated_args,
+      na.rm = na_rm,
+      factory = .ctx$factory
+    )
+  }
+
+  default_fns[[fn_name]] <- fn
+  invisible(fn)
+}
+
+default_fns <- new.env(parent = emptyenv())
+
+# Register translations lazily because SQL users don't need them and because
+# we need rlang for this and it is currently in Suggests
+ensure_translations_registered <- function() {
+  if (!is.null(default_fns$abs)) {
+    return()
+  }
+
+  # Register default translations for our st_, sd_, and rs_ functions
+  fn_names <- utils::.DollarNames(.fns, "^(st|rs|sd)_")
+  for (fn_name in fn_names) {
+    sd_register_datafusion_fn(fn_name)
+  }
+
+  sd_register_translation("base::is.na", function(.ctx, x) {
+    sd_expr_is_null(x, factory = .ctx$factory)
+  })
+
+  sd_register_translation("base::!", function(.ctx, x) {
+    sd_expr_not(x, factory = .ctx$factory)
+  })
+
+  sd_register_translation("base::abs", function(.ctx, x) {
+    sd_expr_scalar_function("abs", list(x), factory = .ctx$factory)
+  })
+
+  # nolint start: object_name_linter
+  sd_register_translation("base::sum", function(.ctx, x, ..., na.rm = FALSE) {
+    sd_expr_aggregate_function("sum", list(x), na.rm = na.rm, factory = .ctx$factory)
+  })
+
+  sd_register_translation("base::mean", function(.ctx, x, ..., na.rm = FALSE) {
+    sd_expr_aggregate_function("avg", list(x), na.rm = na.rm, factory = .ctx$factory)
+  })
+  # nolint end
+
+  sd_register_translation("base::+", function(.ctx, lhs, rhs) {
+    if (missing(rhs)) {
+      # Use a double negative to ensure this fails for non-numeric types
+      sd_expr_negative(
+        sd_expr_negative(lhs, factory = .ctx$factory),
+        factory = .ctx$factory
+      )
+    } else {
+      sd_expr_binary("+", lhs, rhs, factory = .ctx$factory)
+    }
+  })
+
+  sd_register_translation("base::-", function(.ctx, lhs, rhs) {
+    if (missing(rhs)) {
+      sd_expr_negative(lhs, factory = .ctx$factory)
+    } else {
+      sd_expr_binary("-", lhs, rhs, factory = .ctx$factory)
+    }
+  })
+
+  for (op in c("==", "!=", ">", ">=", "<", "<=", "*", "/", "&", "|")) {
+    sd_register_translation(
+      paste0("base::", op),
+      rlang::inject(function(.ctx, lhs, rhs) {
+        sd_expr_binary(!!op, lhs, rhs, factory = .ctx$factory)
+      })
+    )
+  }
+
+  sd_register_translation("dplyr::n", function(.ctx) {
+    sd_expr_aggregate_function("count", list(1L), na.rm = FALSE, factory = .ctx$factory)
+  })
+}

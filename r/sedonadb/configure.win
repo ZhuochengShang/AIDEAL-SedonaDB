@@ -1,0 +1,191 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# We need to link GEOS libs. The cargo build will use pkg-config
+# and then geos-config, in that order, and requires pkg-config to be
+# available (even if it isn't used). Here we just try pkg-config (LIB_DIR
+# can be used to specify the location of -lgeos_c)
+
+pkg-config geos  2>/dev/null
+if [ $? -eq 0 ]; then
+  PKGCONFIG_LIBS=`pkg-config --libs geos`
+fi
+
+if [ "$LIB_DIR" ]; then
+  echo "Found LIB_DIR!"
+  PKG_LIBS="-L$LIB_DIR -lgeos_c $PKG_LIBS"
+elif [ "$PKGCONFIG_CFLAGS" ] || [ "$PKGCONFIG_LIBS" ]; then
+  echo "Found GEOS pkg-config libs!"
+  PKG_LIBS=${PKGCONFIG_LIBS}
+fi
+
+CARGO_VERSION="$(cargo --version)"
+
+if [ $? -ne 0 ]; then
+  echo "-------------- ERROR: CONFIGURATION FAILED --------------------"
+  echo ""
+  echo "The cargo command is not available. To install Rust, please refer"
+  echo "to the official instruction:"
+  echo ""
+  echo "https://www.rust-lang.org/tools/install"
+  echo ""
+  echo "---------------------------------------------------------------"
+
+  exit 1
+fi
+
+# Guard against `cargo` resolving to the rustup-init installer. When the
+# rustup proxy can't find its install state it identifies as "rustup-init"
+# and rejects normal cargo subcommands like `build` and `metadata`, which
+# surfaces as a misleading "unexpected argument 'build'" failure deep in
+# the Make recipe. Fail fast with the real diagnosis. See sedona-db#837.
+case "$CARGO_VERSION" in
+  rustup-init*)
+    echo "-------------- ERROR: CONFIGURATION FAILED --------------------"
+    echo ""
+    echo "'cargo' on PATH is the rustup-init installer, not the rustup"
+    echo "proxy. cargo --version reports:"
+    echo "    $CARGO_VERSION"
+    echo ""
+    echo "Reinstall the stable toolchain with:"
+    echo "    rustup toolchain install stable && rustup default stable"
+    echo ""
+    echo "---------------------------------------------------------------"
+
+    exit 1
+    ;;
+esac
+
+# There's a little chance that rustc is not available on PATH while cargo is.
+# So, just ignore the error case.
+RUSTC_VERSION="$(rustc --version || true)"
+
+# Report the version of Rustc to comply with the CRAN policy
+echo "using Rust package manager: '${CARGO_VERSION}'"
+echo "using Rust compiler: '${RUSTC_VERSION}'"
+
+# If we are in GitHub actions (e.g., R Universe), set the target directory
+# to a very, very short path. If we don't do this, we run out of path length
+# to compile components of the aws-lc-sys crate. This also lets us better
+# cache the compilation.
+if [ -n "$SEDONADB_TARGET_DIR" ];then
+  TARGET_DIR="$SEDONADB_TARGET_DIR"
+elif [ -n "$GITHUB_ACTIONS" ]; then
+  mkdir C:/sedonadb_tmp
+  TARGET_DIR="C:/sedonadb_tmp"
+else
+  TARGET_DIR="$(pwd)/src/rust/target"
+fi
+
+
+# allow overriding profile externally (e.g. on CI)
+if [ -n "${SAVVY_PROFILE}" ]; then
+  PROFILE="${SAVVY_PROFILE}"
+# catch DEBUG envvar, which is passed from pkgbuild::compile_dll()
+elif [ "${DEBUG}" = "true" ]; then
+  PROFILE=dev
+else
+  PROFILE=release
+fi
+
+# e.g. SAVVY_FEATURES="a b"  -->  "--features 'a b'"
+if [ -n "${SAVVY_FEATURES}" ]; then
+  FEATURE_FLAGS="--features '${SAVVY_FEATURES}'"
+fi
+
+# Derive the Rust target from the C compiler architecture. On Windows arm64
+# (clang/gnullvm toolchain) we need aarch64-pc-windows-gnullvm instead of
+# the default x86_64-pc-windows-gnu.
+CC="$("${R_HOME}/bin/R" CMD config CC)"
+case "$($CC -dumpmachine)" in
+  aarch64*|arm64*)
+    TARGET="aarch64-pc-windows-gnullvm"
+    ;;
+  *)
+    TARGET="x86_64-pc-windows-gnu"
+    ;;
+esac
+echo "using Rust target: '${TARGET}'"
+
+# sedona-s2geography needs OpenSSL, Abseil, and s2geometry built with the same
+# MinGW/gnullvm compiler and flags as R. The usual vcpkg Windows triplets use
+# MSVC, whose C++ ABI is not compatible with Rtools.
+S2_VCPKG_ROOT=""
+S2_VCPKG_TARGET_TRIPLET=""
+S2_VCPKG_OVERLAY_TRIPLETS=""
+S2_CMAKE_TOOLCHAIN_FILE=""
+S2_CMAKE_PREFIX_PATH=""
+S2_OPENSSL_ROOT_DIR=""
+SAVVY_FEATURE_WORDS="$(printf '%s' "${SAVVY_FEATURES}" | tr ',' ' ')"
+case " ${SAVVY_FEATURE_WORDS} " in
+  *" s2geography "*)
+    if [ -z "${VCPKG_ROOT}" ] || [ ! -x "${VCPKG_ROOT}/vcpkg.exe" ]; then
+      echo "-------------- ERROR: CONFIGURATION FAILED --------------------"
+      echo ""
+      echo "Building with SAVVY_FEATURES=s2geography on Windows requires"
+      echo "VCPKG_ROOT to point to a bootstrapped vcpkg checkout."
+      echo ""
+      echo "---------------------------------------------------------------"
+      exit 1
+    fi
+
+    VCPKG_ROOT="$(cygpath -m "${VCPKG_ROOT}")"
+    CXX="$("${R_HOME}/bin/R" CMD config CXX17)"
+    CPPFLAGS="$("${R_HOME}/bin/R" CMD config CPPFLAGS)"
+    CFLAGS="$("${R_HOME}/bin/R" CMD config CFLAGS)"
+    CXXFLAGS="$("${R_HOME}/bin/R" CMD config CXX17FLAGS)"
+    LDFLAGS="$("${R_HOME}/bin/R" CMD config LDFLAGS)"
+
+    case "${TARGET}" in
+      aarch64-*) S2_VCPKG_TARGET_TRIPLET="sedonadb-arm64-mingw-static-release" ;;
+      *) S2_VCPKG_TARGET_TRIPLET="sedonadb-x64-mingw-static-release" ;;
+    esac
+
+    S2_VCPKG_ROOT="${VCPKG_ROOT}"
+    S2_VCPKG_OVERLAY_TRIPLETS="$(pwd)/tools/vcpkg-triplets"
+    export SEDONADB_R_CC="${CC}"
+    export SEDONADB_R_CXX="${CXX}"
+    export SEDONADB_R_CFLAGS="${CPPFLAGS} ${CFLAGS}"
+    export SEDONADB_R_CXXFLAGS="${CPPFLAGS} ${CXXFLAGS}"
+    export SEDONADB_R_LDFLAGS="${LDFLAGS}"
+
+    echo "building s2geography dependencies with R's compiler (${CC}, ${CXX})"
+    "${VCPKG_ROOT}/vcpkg.exe" \
+      --overlay-triplets="${S2_VCPKG_OVERLAY_TRIPLETS}" \
+      --triplet="${S2_VCPKG_TARGET_TRIPLET}" \
+      install openssl abseil s2geometry || exit 1
+
+    S2_VCPKG_OVERLAY_TRIPLETS="$(cygpath -m "${S2_VCPKG_OVERLAY_TRIPLETS}")"
+    S2_CMAKE_TOOLCHAIN_FILE="${S2_VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+    S2_CMAKE_PREFIX_PATH="${S2_VCPKG_ROOT}/installed/${S2_VCPKG_TARGET_TRIPLET}"
+    S2_OPENSSL_ROOT_DIR="${S2_CMAKE_PREFIX_PATH}"
+    ;;
+esac
+
+sed \
+  -e "s/@TARGET@/${TARGET}/" \
+  -e "s/@PROFILE@/${PROFILE}/" \
+  -e "s|@TARGET_DIR@|${TARGET_DIR}|" \
+  -e "s/@FEATURE_FLAGS@/${FEATURE_FLAGS}/" \
+  -e "s|@VCPKG_ROOT@|${S2_VCPKG_ROOT}|" \
+  -e "s|@VCPKG_TARGET_TRIPLET@|${S2_VCPKG_TARGET_TRIPLET}|" \
+  -e "s|@VCPKG_OVERLAY_TRIPLETS@|${S2_VCPKG_OVERLAY_TRIPLETS}|" \
+  -e "s|@CMAKE_TOOLCHAIN_FILE@|${S2_CMAKE_TOOLCHAIN_FILE}|" \
+  -e "s|@CMAKE_PREFIX_PATH@|${S2_CMAKE_PREFIX_PATH}|" \
+  -e "s|@OPENSSL_ROOT_DIR@|${S2_OPENSSL_ROOT_DIR}|" \
+  -e "s|@PKG_LIBS@|${PKG_LIBS}|" \
+  src/Makevars.win.in > src/Makevars.win

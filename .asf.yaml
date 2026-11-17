@@ -1,0 +1,57 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+github:
+  description: "A single-node analytical database engine with geospatial as a first-class citizen"
+  homepage: https://sedona.apache.org/sedonadb
+  enabled_merge_buttons:
+    # enable squash button:
+    squash:  true
+    # default commit message when merging with a squash commit
+    # can either be: DEFAULT | PR_TITLE | PR_TITLE_AND_COMMIT_DETAILS | PR_TITLE_AND_DESC
+    squash_commit_message: PR_TITLE
+    # enable merge button:
+    merge:   false
+    # disable rebase button:
+    rebase:  false
+  features:
+    issues: true
+  labels:
+    - geospatial
+    - database
+    - spatial-query
+    - spatial-analysis
+    - spatial-sql
+    - raster
+    - rust
+    - python
+    - c
+    - r
+    - hacktoberfest
+  protected_branches:
+    main: {}
+  collaborators:
+    - jesspav
+    - kadolor
+    - MrPowers
+notifications:
+  commits: commits@sedona.apache.org
+  issues_status: issues@sedona.apache.org
+  issues_comment: issues@sedona.apache.org
+  discussions: issues@sedona.apache.org
+  pullrequests_status: issues@sedona.apache.org
+  pullrequests_comment: issues@sedona.apache.org
